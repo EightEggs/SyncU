@@ -22,7 +22,10 @@ enum SyncMessage {
     Log(String),
     ConfirmDeletion(PathBuf),
     DeletionConfirmed(bool),
+    Progress(f32, String),
     Complete,
+    Stop,
+    Stopped,
 }
 
 fn main() {
@@ -99,6 +102,8 @@ struct FileInfo {
     path: PathBuf,
     hash: String,
     modified: SystemTime,
+    #[serde(default)]
+    size: u64,
 }
 
 #[derive(Serialize, Deserialize, Debug, Default, Clone)]
@@ -121,8 +126,11 @@ struct SyncApp {
     selected_usb_drive: Option<PathBuf>,
     sync_log: Vec<String>,
     syncing: bool,
+    stopping: bool,
     show_confirmation: bool,
     file_to_delete: Option<PathBuf>,
+    progress: f32,
+    current_file: String,
     tx_to_sync: Sender<SyncMessage>,
     rx_from_sync: Receiver<SyncMessage>,
     ctx: egui::Context,
@@ -155,8 +163,11 @@ impl SyncApp {
             selected_usb_drive,
             sync_log: vec!["准备就绪".to_owned()],
             syncing: false,
+            stopping: false,
             show_confirmation: false,
             file_to_delete: None,
+            progress: 0.0,
+            current_file: "".to_owned(),
             tx_to_sync,
             rx_from_sync,
             ctx,
@@ -173,7 +184,18 @@ impl eframe::App for SyncApp {
                     self.show_confirmation = true;
                     self.file_to_delete = Some(path);
                 }
-                SyncMessage::Complete => self.syncing = false,
+                SyncMessage::Progress(progress, file) => {
+                    self.progress = progress;
+                    self.current_file = file;
+                }
+                SyncMessage::Complete => {
+                    self.syncing = false;
+                    self.stopping = false;
+                }
+                SyncMessage::Stopped => {
+                    self.syncing = false;
+                    self.stopping = false;
+                }
                 _ => {}
             }
             self.ctx.request_repaint();
@@ -213,52 +235,73 @@ impl eframe::App for SyncApp {
             ui.heading("SyncU - 便捷地在计算机和U盘之间同步文件");
             ui.add_space(10.0);
 
-            egui::Grid::new("path_grid")
-                .num_columns(3)
-                .spacing([10.0, 10.0])
-                .show(ui, |ui| {
-                    ui.label("本地文件夹:");
-                    let local_path_text = self.local_folder.as_ref().map_or_else(
-                        || "未选择".to_owned(),
-                        |p| p.display().to_string(),
-                    );
-                    ui.label(&local_path_text);
-                    if ui.button("选择...").clicked() {
-                        if let Some(path) = rfd::FileDialog::new().pick_folder() {
-                            self.local_folder = Some(path);
-                        }
-                    }
-                    ui.end_row();
-
-                    ui.label("U盘:");
-                    if self.usb_drives.len() > 1 {
-                        egui::ComboBox::from_label("")
-                            .selected_text(self.selected_usb_drive.as_ref().map_or("请选择U盘", |p| p.to_str().unwrap_or_default()))
-                            .show_ui(ui, |ui| {
-                                for drive in &self.usb_drives {
-                                    ui.selectable_value(&mut self.selected_usb_drive, Some(drive.clone()), drive.to_str().unwrap_or_default());
-                                }
-                            });
-                    } else {
-                        let usb_path_text = self.selected_usb_drive.as_ref().map_or_else(
-                            || "未检测到".to_owned(),
+            ui.add_enabled_ui(!self.syncing, |ui| {
+                egui::Grid::new("path_grid")
+                    .num_columns(3)
+                    .spacing([10.0, 10.0])
+                    .show(ui, |ui| {
+                        ui.label("本地文件夹:");
+                        let local_path_text = self.local_folder.as_ref().map_or_else(
+                            || "未选择".to_owned(),
                             |p| p.display().to_string(),
                         );
-                        ui.label(&usb_path_text);
-                    }
-                    if ui.button("刷新").clicked() {
-                        self.usb_drives = find_usb_drives();
-                        self.selected_usb_drive = if self.usb_drives.len() == 1 { Some(self.usb_drives[0].clone()) } else { None };
-                    }
-                    ui.end_row();
-                });
+                        ui.label(&local_path_text);
+                        if ui.button("选择...").clicked() {
+                            if let Some(path) = rfd::FileDialog::new().pick_folder() {
+                                self.local_folder = Some(path);
+                            }
+                        }
+                        ui.end_row();
 
+                        ui.label("U盘:");
+                        if self.usb_drives.len() > 1 {
+                            egui::ComboBox::from_label("")
+                                .selected_text(self.selected_usb_drive.as_ref().map_or("请选择U盘", |p| p.to_str().unwrap_or_default()))
+                                .show_ui(ui, |ui| {
+                                    for drive in &self.usb_drives {
+                                        ui.selectable_value(&mut self.selected_usb_drive, Some(drive.clone()), drive.to_str().unwrap_or_default());
+                                    }
+                                });
+                        } else {
+                            let usb_path_text = self.selected_usb_drive.as_ref().map_or_else(
+                                || "未检测到".to_owned(),
+                                |p| p.display().to_string(),
+                            );
+                            ui.label(&usb_path_text);
+                        }
+                        if ui.button("刷新").clicked() {
+                            self.usb_drives = find_usb_drives();
+                            self.selected_usb_drive = if self.usb_drives.len() == 1 { Some(self.usb_drives[0].clone()) } else { None };
+                        }
+                        ui.end_row();
+                    });
+            });
+
+            ui.separator();
             ui.add_space(10.0);
+
             ui.scope(|ui| {
                 ui.set_min_height(40.0);
                 ui.vertical_centered_justified(|ui| {
                     if self.syncing {
-                        ui.add(egui::Spinner::new());
+                        if self.stopping {
+                            let stop_button = egui::Button::new(
+                                egui::RichText::new("正在停止...").color(egui::Color32::WHITE),
+                            )
+                            .fill(egui::Color32::from_rgb(150, 0, 0))
+                            .min_size(egui::vec2(120.0, 40.0));
+                            ui.add_enabled(false, stop_button);
+                        } else {
+                            let stop_button = egui::Button::new(
+                                egui::RichText::new("停止同步").color(egui::Color32::WHITE),
+                            )
+                            .fill(egui::Color32::from_rgb(200, 0, 0))
+                            .min_size(egui::vec2(120.0, 40.0));
+                            if ui.add(stop_button).clicked() {
+                                self.stopping = true;
+                                self.tx_to_sync.send(SyncMessage::Stop).unwrap_or_default();
+                            }
+                        }
                     } else {
                         let enabled = self.local_folder.is_some() && self.selected_usb_drive.is_some();
                         if ui.add_enabled(enabled, egui::Button::new("立即同步").min_size(egui::vec2(120.0, 40.0))).clicked() {
@@ -272,12 +315,20 @@ impl eframe::App for SyncApp {
                     }
                 });
             });
-            ui.separator();
+
             ui.add_space(10.0);
+            ui.separator();
+
+            if self.syncing {
+                ui.add(egui::ProgressBar::new(self.progress).show_percentage());
+                ui.label(&self.current_file);
+                ui.add_space(10.0);
+            }
 
             egui::Frame::canvas(ui.style()).show(ui, |ui| {
                 egui::ScrollArea::vertical().show(ui, |ui| {
-                    ui.label(self.sync_log.join("\n"));
+                    ui.label(self.sync_log.join("
+"));
                 });
             });
         });
@@ -290,7 +341,7 @@ fn run_sync(
     tx: Sender<SyncMessage>,
     rx: &Receiver<SyncMessage>,
 ) {
-    match (|| -> Result<(), Box<dyn std::error::Error>> {
+    let was_stopped = match (|| -> Result<bool, Box<dyn std::error::Error>> {
         let local_path = local_folder.as_ref().ok_or("未选择本地文件夹")?;
         let usb_root_path = usb_drive.as_ref().ok_or("未检测到U盘")?;
 
@@ -306,7 +357,6 @@ fn run_sync(
 
         let mut sync_plan = Vec::new();
 
-        // Three-way comparison
         let all_files: Vec<_> = local_sync_data
             .files
             .keys()
@@ -317,81 +367,102 @@ fn run_sync(
             .cloned()
             .collect();
 
-        for relative_path in all_files {
-            let local_file = local_sync_data.files.get(&relative_path);
-            let remote_file = remote_sync_data.files.get(&relative_path);
-            let last_sync_file = last_sync_data.files.get(&relative_path);
+        let total_files = all_files.len() as f32;
+        for (i, relative_path) in all_files.iter().enumerate() {
+            if let Ok(SyncMessage::Stop) = rx.try_recv() {
+                let msg = format!("[{}] 同步已由用户停止。", Local::now().format("%Y-%m-%d %H:%M:%S"));
+                write_log_entry(&msg, &usb_sync_path)?;
+                tx.send(SyncMessage::Log(msg))?;
+                return Ok(true);
+            }
+            tx.send(SyncMessage::Progress(i as f32 / total_files, relative_path.to_str().unwrap_or_default().to_string()))?;
+
+            let local_file = local_sync_data.files.get(relative_path);
+            let remote_file = remote_sync_data.files.get(relative_path);
+            let last_sync_file = last_sync_data.files.get(relative_path);
 
             match (local_file, remote_file, last_sync_file) {
-                // Case 1: File exists everywhere
                 (Some(local), Some(remote), Some(last)) => {
-                    let local_changed = local.hash != last.hash;
-                    let remote_changed = remote.hash != last.hash;
-
-                    if local_changed && !remote_changed {
-                        sync_plan.push(SyncAction::Upload(relative_path));
-                    } else if !local_changed && remote_changed {
-                        sync_plan.push(SyncAction::Download(relative_path));
-                    } else if local_changed && remote_changed {
-                        if local.hash != remote.hash {
-                            sync_plan.push(SyncAction::Conflict(relative_path));
-                        }
+                    if local.modified > last.modified && local.size != last.size {
+                        sync_plan.push(SyncAction::Upload(relative_path.clone()));
+                    } else if remote.modified > last.modified && remote.size != last.size {
+                        sync_plan.push(SyncAction::Download(relative_path.clone()));
+                    } else if local.modified > last.modified && remote.modified > last.modified {
+                        sync_plan.push(SyncAction::Conflict(relative_path.clone()));
                     }
                 }
-                // Case 2: New local file
-                (Some(_local), None, None) => {
-                    sync_plan.push(SyncAction::Upload(relative_path));
-                }
-                // Case 3: New remote file
-                (None, Some(_remote), None) => {
-                    sync_plan.push(SyncAction::Download(relative_path));
-                }
-                // Case 4: File deleted locally
-                (None, Some(_remote), Some(_last)) => {
-                    sync_plan.push(SyncAction::DeleteRemote(relative_path));
-                }
-                // Case 5: File deleted remotely
-                (Some(_local), None, Some(_last)) => {
-                    sync_plan.push(SyncAction::DeleteLocal(relative_path));
-                }
+                (Some(_local), None, None) => sync_plan.push(SyncAction::Upload(relative_path.clone())),
+                (None, Some(_remote), None) => sync_plan.push(SyncAction::Download(relative_path.clone())),
+                (None, Some(_remote), Some(_last)) => sync_plan.push(SyncAction::DeleteRemote(relative_path.clone())),
+                (Some(_local), None, Some(_last)) => sync_plan.push(SyncAction::DeleteLocal(relative_path.clone())),
                 _ => {}
             }
         }
 
-        let mut log = Vec::new();
+        let mut log_empty = true;
         for action in sync_plan {
-            let timestamp = Local::now().format("%Y-%m-%d %H:%M:%S");
+            log_empty = false;
+            if let Ok(SyncMessage::Stop) = rx.try_recv() {
+                let msg = format!("[{}] 同步已由用户停止。", Local::now().format("%Y-%m-%d %H:%M:%S"));
+                write_log_entry(&msg, &usb_sync_path)?;
+                tx.send(SyncMessage::Log(msg))?;
+                return Ok(true);
+            }
             let message = match action {
                 SyncAction::Upload(path) => {
                     copy_file(local_path, &usb_sync_path, &path)?;
-                    format!("[{}] 上传: 本地 -> U盘: {}", timestamp, path.display())
+                    format!("[{}] 上传: 本地 -> U盘: {}", Local::now().format("%Y-%m-%d %H:%M:%S"), path.display())
                 }
                 SyncAction::Download(path) => {
                     copy_file(&usb_sync_path, local_path, &path)?;
-                    format!("[{}] 下载: U盘 -> 本地: {}", timestamp, path.display())
+                    format!("[{}] 下载: U盘 -> 本地: {}", Local::now().format("%Y-%m-%d %H:%M:%S"), path.display())
                 }
                 SyncAction::DeleteRemote(path) => {
                     let absolute_path = usb_sync_path.join(&path);
                     tx.send(SyncMessage::ConfirmDeletion(absolute_path.clone()))?;
-                    if let Ok(SyncMessage::DeletionConfirmed(true)) = rx.recv() {
+                    let confirmed = loop {
+                        match rx.recv()? {
+                            SyncMessage::DeletionConfirmed(c) => break c,
+                            SyncMessage::Stop => {
+                                let msg = format!("[{}] 同步已由用户停止。", Local::now().format("%Y-%m-%d %H:%M:%S"));
+                                write_log_entry(&msg, &usb_sync_path)?;
+                                tx.send(SyncMessage::Log(msg))?;
+                                return Ok(true);
+                            }
+                            _ => {}
+                        }
+                    };
+                    if confirmed {
                         if absolute_path.exists() {
                             fs::remove_file(absolute_path)?;
                         }
-                        format!("[{}] 删除: U盘: {}", timestamp, path.display())
+                        format!("[{}] 删除: U盘: {}", Local::now().format("%Y-%m-%d %H:%M:%S"), path.display())
                     } else {
-                        format!("[{}] 取消删除: U盘: {}", timestamp, path.display())
+                        format!("[{}] 取消删除: U盘: {}", Local::now().format("%Y-%m-%d %H:%M:%S"), path.display())
                     }
                 }
                 SyncAction::DeleteLocal(path) => {
                     let absolute_path = local_path.join(&path);
                     tx.send(SyncMessage::ConfirmDeletion(absolute_path.clone()))?;
-                    if let Ok(SyncMessage::DeletionConfirmed(true)) = rx.recv() {
+                    let confirmed = loop {
+                        match rx.recv()? {
+                            SyncMessage::DeletionConfirmed(c) => break c,
+                            SyncMessage::Stop => {
+                                let msg = format!("[{}] 同步已由用户停止。", Local::now().format("%Y-%m-%d %H:%M:%S"));
+                                write_log_entry(&msg, &usb_sync_path)?;
+                                tx.send(SyncMessage::Log(msg))?;
+                                return Ok(true);
+                            }
+                            _ => {}
+                        }
+                    };
+                    if confirmed {
                         if absolute_path.exists() {
                             fs::remove_file(absolute_path)?;
                         }
-                        format!("[{}] 删除: 本地: {}", timestamp, path.display())
+                        format!("[{}] 删除: 本地: {}", Local::now().format("%Y-%m-%d %H:%M:%S"), path.display())
                     } else {
-                        format!("[{}] 取消删除: 本地: {}", timestamp, path.display())
+                        format!("[{}] 取消删除: 本地: {}", Local::now().format("%Y-%m-%d %H:%M:%S"), path.display())
                     }
                 }
                 SyncAction::Conflict(path) => {
@@ -403,29 +474,36 @@ fn run_sync(
                     copy_file(&usb_sync_path, local_path, &path)?;
                     format!(
                         "[{}] 冲突: {} 已备份至 {}",
-                        timestamp,
+                        Local::now().format("%Y-%m-%d %H:%M:%S"),
                         path.display(),
                         conflict_path.display()
                     )
                 }
             };
             tx.send(SyncMessage::Log(message.clone()))?;
-            log.push(message);
+            write_log_entry(&message, &usb_sync_path)?;
         }
 
         let final_sync_data = scan_directory(local_path)?;
         save_sync_data(&final_sync_data, &metadata_path)?;
-        write_log_to_file(&log, &usb_sync_path)?;
 
-        if log.is_empty() {
+        if log_empty {
             tx.send(SyncMessage::Log("同步完成! 未检测到变化.".to_owned()))?;
         }
-        Ok(())
+        Ok(false)
     })() {
-        Ok(_) => {},
-        Err(e) => tx.send(SyncMessage::Log(format!("错误: {}", e))).unwrap_or_default(),
+        Ok(stopped) => stopped,
+        Err(e) => {
+            tx.send(SyncMessage::Log(format!("错误: {}", e))).unwrap_or_default();
+            false
+        }
+    };
+
+    if was_stopped {
+        tx.send(SyncMessage::Stopped).unwrap_or_default();
+    } else {
+        tx.send(SyncMessage::Complete).unwrap_or_default();
     }
-    tx.send(SyncMessage::Complete).unwrap_or_default();
 }
 
 fn find_usb_drives() -> Vec<PathBuf> {
@@ -450,8 +528,13 @@ fn scan_directory(base_path: &Path) -> Result<SyncData, Box<dyn std::error::Erro
             }
             let metadata = fs::metadata(&path)?;
             let modified = metadata.modified()?;
-            let content = fs::read(&path)?;
-            let hash = format!("{:x}", Sha256::digest(&content));
+            let size = metadata.len();
+            let hash = if metadata.len() < 1_000_000 { // Only hash small files
+                let content = fs::read(&path)?;
+                format!("{:x}", Sha256::digest(&content))
+            } else {
+                String::new()
+            };
 
             let relative_path = path.strip_prefix(base_path)?.to_path_buf();
 
@@ -461,6 +544,7 @@ fn scan_directory(base_path: &Path) -> Result<SyncData, Box<dyn std::error::Erro
                     path: relative_path,
                     hash,
                     modified,
+                    size,
                 },
             );
         }
@@ -495,16 +579,12 @@ fn copy_file(from_dir: &Path, to_dir: &Path, relative_path: &Path) -> Result<(),
     Ok(())
 }
 
-fn write_log_to_file(log: &[String], usb_path: &Path) -> Result<(), Box<dyn std::error::Error>> {
+fn write_log_entry(entry: &str, usb_path: &Path) -> Result<(), Box<dyn std::error::Error>> {
     let log_path = usb_path.join("SyncU.log");
     let mut file = fs::OpenOptions::new()
         .create(true)
         .append(true)
         .open(log_path)?;
-
-    for entry in log {
-        writeln!(file, "{}", entry)?;
-    }
-
+    writeln!(file, "{}", entry)?;
     Ok(())
 }
