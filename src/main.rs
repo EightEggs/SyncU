@@ -32,7 +32,7 @@ enum SyncMessage {
 fn main() {
     let icon = create_icon();
     let options = eframe::NativeOptions {
-        initial_window_size: Some(egui::vec2(600.0, 400.0)),
+        initial_window_size: Some(egui::vec2(500.0, 400.0)),
         icon_data: Some(eframe::IconData {
             rgba: icon.into_raw(),
             width: 64,
@@ -255,7 +255,7 @@ impl eframe::App for SyncApp {
 
         egui::CentralPanel::default().show(ctx, |ui| {
             ui.horizontal(|ui| {
-                ui.heading("SyncU: Sync Your File with USB");
+                ui.heading("SyncU - 便捷地在计算机和U盘之间同步文件");
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if ui.button("关于").clicked() {
                         self.show_about_window = true;
@@ -374,10 +374,24 @@ fn run_sync(
 
         let metadata_path = usb_sync_path.join(".syncu_metadata.json");
 
-        tx.send(SyncMessage::Progress(0.0, "正在扫描文件...".to_string()))?;
+        tx.send(SyncMessage::Progress(0.0, "正在加载上次同步记录...".to_string()))?;
         let last_sync_data = load_sync_data(&metadata_path)?;
-        let local_sync_data = scan_directory(local_path)?;
-        let remote_sync_data = scan_directory(&usb_sync_path)?;
+
+        // Scan local directory with progress
+        tx.send(SyncMessage::Progress(0.0, "正在统计本地文件...".to_string()))?;
+        let local_total = WalkDir::new(local_path).into_iter().filter_map(|e| e.ok()).filter(|e| e.file_type().is_file()).count();
+        let local_sync_data = match scan_directory_with_progress(local_path, &tx, rx, local_total, "扫描本地")? {
+            Some(data) => data,
+            None => return Ok(true), // Stopped
+        };
+
+        // Scan remote directory with progress
+        tx.send(SyncMessage::Progress(0.0, "正在统计U盘文件...".to_string()))?;
+        let remote_total = WalkDir::new(&usb_sync_path).into_iter().filter_map(|e| e.ok()).filter(|e| e.file_type().is_file()).count();
+        let remote_sync_data = match scan_directory_with_progress(&usb_sync_path, &tx, rx, remote_total, "扫描U盘")? {
+            Some(data) => data,
+            None => return Ok(true), // Stopped
+        };
 
         let mut sync_plan = Vec::new();
 
@@ -394,9 +408,6 @@ fn run_sync(
         tx.send(SyncMessage::Progress(0.0, "正在分析文件差异...".to_string()))?;
         for relative_path in all_files.iter() {
             if let Ok(SyncMessage::Stop) = rx.try_recv() {
-                let msg = format!("[{}] 同步已由用户停止。", Local::now().format("%Y-%m-%d %H:%M:%S"));
-                write_log_entry(&msg, &usb_sync_path)?;
-                tx.send(SyncMessage::Log(msg))?;
                 return Ok(true);
             }
 
@@ -438,6 +449,10 @@ fn run_sync(
         }
 
         for action in sync_plan {
+            if let Ok(SyncMessage::Stop) = rx.try_recv() {
+                return Ok(true);
+            }
+
             let file_size = match &action {
                 SyncAction::Upload(path) => fs::metadata(local_path.join(path))?.len(),
                 SyncAction::Download(path) => fs::metadata(usb_sync_path.join(path))?.len(),
@@ -544,8 +559,10 @@ fn run_sync(
             write_log_entry(&message, &usb_sync_path)?;
         }
 
-        let final_sync_data = scan_directory(local_path)?;
-        save_sync_data(&final_sync_data, &metadata_path)?;
+        let final_sync_data = scan_directory_with_progress(local_path, &tx, rx, local_total, "更新本地元数据")?;
+        if let Some(final_sync_data) = final_sync_data {
+            save_sync_data(&final_sync_data, &metadata_path)?;
+        }
 
         tx.send(SyncMessage::Progress(1.0, "同步完成!".to_string()))?;
         Ok(false)
@@ -564,6 +581,8 @@ fn run_sync(
     };
 
     if was_stopped {
+        let msg = format!("[{}] 同步已由用户停止。", Local::now().format("%Y-%m-%d %H:%M:%S"));
+        tx.send(SyncMessage::Log(msg)).unwrap_or_default();
         tx.send(SyncMessage::Stopped).unwrap_or_default();
     } else {
         tx.send(SyncMessage::Complete).unwrap_or_default();
@@ -580,16 +599,35 @@ fn find_usb_drives() -> Vec<PathBuf> {
         .collect()
 }
 
-fn scan_directory(base_path: &Path) -> Result<SyncData, Box<dyn std::error::Error>> {
+fn scan_directory_with_progress(
+    base_path: &Path,
+    tx: &Sender<SyncMessage>,
+    rx: &Receiver<SyncMessage>,
+    total_files: usize,
+    ui_message_prefix: &str,
+) -> Result<Option<SyncData>, Box<dyn std::error::Error>> {
     let mut files = HashMap::new();
-    for entry in WalkDir::new(base_path).into_iter().filter_map(|e| e.ok()) {
+    let walker = WalkDir::new(base_path).into_iter();
+    let mut processed_files = 0;
+
+    for entry in walker.filter_map(|e| e.ok()) {
+        if let Ok(SyncMessage::Stop) = rx.try_recv() {
+            return Ok(None); // Stopped
+        }
+
         if entry.file_type().is_file() {
+            processed_files += 1;
             let path = entry.path().to_path_buf();
             if path.file_name().unwrap_or_default() == ".syncu_metadata.json"
                 || path.file_name().unwrap_or_default() == "SyncU.log"
             {
                 continue;
             }
+
+            let progress = if total_files > 0 { processed_files as f32 / total_files as f32 } else { 1.0 };
+            let file_name = entry.path().file_name().unwrap_or_default().to_str().unwrap_or_default();
+            tx.send(SyncMessage::Progress(progress, format!("{} ({}/{}) - {}", ui_message_prefix, processed_files, total_files, file_name)))?;
+
             let metadata = fs::metadata(&path)?;
             let modified = metadata.modified()?;
             let size = metadata.len();
@@ -613,7 +651,7 @@ fn scan_directory(base_path: &Path) -> Result<SyncData, Box<dyn std::error::Erro
             );
         }
     }
-    Ok(SyncData { files })
+    Ok(Some(SyncData { files }))
 }
 
 fn save_sync_data(sync_data: &SyncData, path: &Path) -> Result<(), Box<dyn std::error::Error>> {
