@@ -32,7 +32,7 @@ enum SyncMessage {
 fn main() {
     let icon = create_icon();
     let options = eframe::NativeOptions {
-        initial_window_size: Some(egui::vec2(500.0, 400.0)),
+        initial_window_size: Some(egui::vec2(600.0, 400.0)),
         icon_data: Some(eframe::IconData {
             rgba: icon.into_raw(),
             width: 64,
@@ -255,7 +255,7 @@ impl eframe::App for SyncApp {
 
         egui::CentralPanel::default().show(ctx, |ui| {
             ui.horizontal(|ui| {
-                ui.heading("SyncU - 便捷地在计算机和U盘之间同步文件");
+                ui.heading("SyncU: Sync Your File with USB");
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if ui.button("关于").clicked() {
                         self.show_about_window = true;
