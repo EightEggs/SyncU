@@ -6,16 +6,17 @@ use image::{ImageBuffer, Rgba};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
-use std::fs;
-use std::io::Write;
+use std::fs::{self, File, OpenOptions};
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::thread;
-use std::time::SystemTime;
+use std::time::{Instant, SystemTime};
 use sysinfo::{DiskExt, System, SystemExt};
 use walkdir::WalkDir;
 
 const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
+const LARGE_FILE_THRESHOLD: u64 = 10 * 1024 * 1024; // 10 MB
 
 #[derive(Clone)]
 enum SyncMessage {
@@ -128,6 +129,7 @@ struct SyncApp {
     syncing: bool,
     stopping: bool,
     show_confirmation: bool,
+    show_about_window: bool,
     file_to_delete: Option<PathBuf>,
     progress: f32,
     current_file: String,
@@ -165,6 +167,7 @@ impl SyncApp {
             syncing: false,
             stopping: false,
             show_confirmation: false,
+            show_about_window: false,
             file_to_delete: None,
             progress: 0.0,
             current_file: "".to_owned(),
@@ -222,17 +225,43 @@ impl eframe::App for SyncApp {
                 });
         }
 
-        egui::TopBottomPanel::bottom("status_bar").show(ctx, |ui| {
-            ui.horizontal(|ui| {
-                ui.label(format!("SyncU v{}", APP_VERSION));
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    ui.label("作者: Eight_Eggs");
+        if self.show_about_window {
+            egui::Window::new("关于 SyncU")
+                .collapsible(false)
+                .resizable(false)
+                .show(ctx, |ui| {
+                    ui.vertical_centered(|ui| {
+                        ui.heading("SyncU");
+                        ui.label(format!("版本: {}", APP_VERSION));
+                        ui.label("作者: Eight_Eggs");
+                        ui.hyperlink_to("访问 GitHub 仓库", "https://github.com/EightEggs/SyncU");
+                        if ui.button("关闭").clicked() {
+                            self.show_about_window = false;
+                        }
+                    });
                 });
-            });
+        }
+
+        egui::TopBottomPanel::bottom("status_bar").show(ctx, |ui| {
+            if self.syncing {
+                ui.horizontal(|ui| {
+                    ui.add(egui::ProgressBar::new(self.progress).show_percentage().desired_width(200.0));
+                    ui.label(&self.current_file);
+                });
+            } else {
+                ui.label("准备就绪");
+            }
         });
 
         egui::CentralPanel::default().show(ctx, |ui| {
-            ui.heading("SyncU - 便捷地在计算机和U盘之间同步文件");
+            ui.horizontal(|ui| {
+                ui.heading("SyncU - 便捷地在计算机和U盘之间同步文件");
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui.button("关于").clicked() {
+                        self.show_about_window = true;
+                    }
+                });
+            });
             ui.add_space(10.0);
 
             ui.add_enabled_ui(!self.syncing, |ui| {
@@ -319,12 +348,6 @@ impl eframe::App for SyncApp {
             ui.add_space(10.0);
             ui.separator();
 
-            if self.syncing {
-                ui.add(egui::ProgressBar::new(self.progress).show_percentage());
-                ui.label(&self.current_file);
-                ui.add_space(10.0);
-            }
-
             egui::Frame::canvas(ui.style()).show(ui, |ui| {
                 egui::ScrollArea::vertical().show(ui, |ui| {
                     ui.label(self.sync_log.join("
@@ -351,6 +374,7 @@ fn run_sync(
 
         let metadata_path = usb_sync_path.join(".syncu_metadata.json");
 
+        tx.send(SyncMessage::Progress(0.0, "正在扫描文件...".to_string()))?;
         let last_sync_data = load_sync_data(&metadata_path)?;
         let local_sync_data = scan_directory(local_path)?;
         let remote_sync_data = scan_directory(&usb_sync_path)?;
@@ -367,15 +391,14 @@ fn run_sync(
             .cloned()
             .collect();
 
-        let total_files = all_files.len() as f32;
-        for (i, relative_path) in all_files.iter().enumerate() {
+        tx.send(SyncMessage::Progress(0.0, "正在分析文件差异...".to_string()))?;
+        for relative_path in all_files.iter() {
             if let Ok(SyncMessage::Stop) = rx.try_recv() {
                 let msg = format!("[{}] 同步已由用户停止。", Local::now().format("%Y-%m-%d %H:%M:%S"));
                 write_log_entry(&msg, &usb_sync_path)?;
                 tx.send(SyncMessage::Log(msg))?;
                 return Ok(true);
             }
-            tx.send(SyncMessage::Progress(i as f32 / total_files, relative_path.to_str().unwrap_or_default().to_string()))?;
 
             let local_file = local_sync_data.files.get(relative_path);
             let remote_file = remote_sync_data.files.get(relative_path);
@@ -399,22 +422,57 @@ fn run_sync(
             }
         }
 
-        let mut log_empty = true;
+        let total_sync_size = sync_plan.iter().try_fold(0u64, |acc, action| -> Result<u64, Box<dyn std::error::Error>> {
+            Ok(acc + match action {
+                SyncAction::Upload(path) => fs::metadata(local_path.join(path))?.len(),
+                SyncAction::Download(path) => fs::metadata(usb_sync_path.join(path))?.len(),
+                SyncAction::Conflict(path) => fs::metadata(local_path.join(path))?.len(),
+                _ => 0,
+            })
+        })?;
+
+        let mut processed_size = 0u64;
+
+        if sync_plan.is_empty() {
+            tx.send(SyncMessage::Log("同步完成! 未检测到变化.".to_owned()))?;
+        }
+
         for action in sync_plan {
-            log_empty = false;
-            if let Ok(SyncMessage::Stop) = rx.try_recv() {
-                let msg = format!("[{}] 同步已由用户停止。", Local::now().format("%Y-%m-%d %H:%M:%S"));
-                write_log_entry(&msg, &usb_sync_path)?;
-                tx.send(SyncMessage::Log(msg))?;
-                return Ok(true);
-            }
+            let file_size = match &action {
+                SyncAction::Upload(path) => fs::metadata(local_path.join(path))?.len(),
+                SyncAction::Download(path) => fs::metadata(usb_sync_path.join(path))?.len(),
+                SyncAction::Conflict(path) => fs::metadata(local_path.join(path))?.len(),
+                _ => 0,
+            };
+
+            let current_file_name = match &action {
+                SyncAction::Upload(path) | SyncAction::Download(path) | SyncAction::Conflict(path) => path.to_str().unwrap_or_default().to_string(),
+                SyncAction::DeleteLocal(path) | SyncAction::DeleteRemote(path) => format!("删除: {}", path.to_str().unwrap_or_default()),
+            };
+
             let message = match action {
                 SyncAction::Upload(path) => {
-                    copy_file(local_path, &usb_sync_path, &path)?;
+                    let from = local_path.join(&path);
+                    let to = usb_sync_path.join(&path);
+                    if file_size > LARGE_FILE_THRESHOLD {
+                        if copy_large_file_with_progress(&from, &to, &current_file_name, &tx, rx, total_sync_size, processed_size)? {
+                            return Ok(true); // Stopped
+                        }
+                    } else {
+                        fs::copy(&from, &to)?;
+                    }
                     format!("[{}] 上传: 本地 -> U盘: {}", Local::now().format("%Y-%m-%d %H:%M:%S"), path.display())
                 }
                 SyncAction::Download(path) => {
-                    copy_file(&usb_sync_path, local_path, &path)?;
+                    let from = usb_sync_path.join(&path);
+                    let to = local_path.join(&path);
+                     if file_size > LARGE_FILE_THRESHOLD {
+                        if copy_large_file_with_progress(&from, &to, &current_file_name, &tx, rx, total_sync_size, processed_size)? {
+                            return Ok(true); // Stopped
+                        }
+                    } else {
+                        fs::copy(&from, &to)?;
+                    }
                     format!("[{}] 下载: U盘 -> 本地: {}", Local::now().format("%Y-%m-%d %H:%M:%S"), path.display())
                 }
                 SyncAction::DeleteRemote(path) => {
@@ -423,12 +481,7 @@ fn run_sync(
                     let confirmed = loop {
                         match rx.recv()? {
                             SyncMessage::DeletionConfirmed(c) => break c,
-                            SyncMessage::Stop => {
-                                let msg = format!("[{}] 同步已由用户停止。", Local::now().format("%Y-%m-%d %H:%M:%S"));
-                                write_log_entry(&msg, &usb_sync_path)?;
-                                tx.send(SyncMessage::Log(msg))?;
-                                return Ok(true);
-                            }
+                            SyncMessage::Stop => return Ok(true),
                             _ => {}
                         }
                     };
@@ -447,12 +500,7 @@ fn run_sync(
                     let confirmed = loop {
                         match rx.recv()? {
                             SyncMessage::DeletionConfirmed(c) => break c,
-                            SyncMessage::Stop => {
-                                let msg = format!("[{}] 同步已由用户停止。", Local::now().format("%Y-%m-%d %H:%M:%S"));
-                                write_log_entry(&msg, &usb_sync_path)?;
-                                tx.send(SyncMessage::Log(msg))?;
-                                return Ok(true);
-                            }
+                            SyncMessage::Stop => return Ok(true),
                             _ => {}
                         }
                     };
@@ -471,7 +519,15 @@ fn run_sync(
                         format!("{}.conflict", local_file_path.extension().unwrap_or_default().to_str().unwrap_or(""))
                     );
                     fs::rename(&local_file_path, &conflict_path)?;
-                    copy_file(&usb_sync_path, local_path, &path)?;
+                    let from = usb_sync_path.join(&path);
+                    let to = local_path.join(&path);
+                    if file_size > LARGE_FILE_THRESHOLD {
+                        if copy_large_file_with_progress(&from, &to, &current_file_name, &tx, rx, total_sync_size, processed_size)? {
+                            return Ok(true); // Stopped
+                        }
+                    } else {
+                        fs::copy(&from, &to)?;
+                    }
                     format!(
                         "[{}] 冲突: {} 已备份至 {}",
                         Local::now().format("%Y-%m-%d %H:%M:%S"),
@@ -480,6 +536,10 @@ fn run_sync(
                     )
                 }
             };
+            processed_size += file_size;
+            if total_sync_size > 0 {
+                 tx.send(SyncMessage::Progress(processed_size as f32 / total_sync_size as f32, current_file_name))?;
+            }
             tx.send(SyncMessage::Log(message.clone()))?;
             write_log_entry(&message, &usb_sync_path)?;
         }
@@ -487,14 +547,18 @@ fn run_sync(
         let final_sync_data = scan_directory(local_path)?;
         save_sync_data(&final_sync_data, &metadata_path)?;
 
-        if log_empty {
-            tx.send(SyncMessage::Log("同步完成! 未检测到变化.".to_owned()))?;
-        }
+        tx.send(SyncMessage::Progress(1.0, "同步完成!".to_string()))?;
         Ok(false)
     })() {
         Ok(stopped) => stopped,
         Err(e) => {
-            tx.send(SyncMessage::Log(format!("错误: {}", e))).unwrap_or_default();
+            let msg = format!("错误: {}", e);
+            tx.send(SyncMessage::Log(msg.clone())).unwrap_or_default();
+            if let (Some(local_folder), Some(usb_drive)) = (local_folder, usb_drive) {
+                let sync_folder_name = local_folder.file_name().unwrap();
+                let usb_sync_path = usb_drive.join(sync_folder_name);
+                write_log_entry(&msg, &usb_sync_path).ok();
+            }
             false
         }
     };
@@ -567,21 +631,55 @@ fn load_sync_data(path: &Path) -> Result<SyncData, Box<dyn std::error::Error>> {
     Ok(sync_data)
 }
 
-fn copy_file(from_dir: &Path, to_dir: &Path, relative_path: &Path) -> Result<(), Box<dyn std::error::Error>> {
-    let from = from_dir.join(relative_path);
-    let to = to_dir.join(relative_path);
-
+fn copy_large_file_with_progress(
+    from: &Path,
+    to: &Path,
+    file_name_for_ui: &str,
+    tx: &Sender<SyncMessage>,
+    rx: &Receiver<SyncMessage>,
+    total_sync_size: u64,
+    processed_size_before: u64,
+) -> Result<bool, Box<dyn std::error::Error>> {
     if let Some(parent) = to.parent() {
         fs::create_dir_all(parent)?;
     }
 
-    fs::copy(&from, &to)?;
-    Ok(())
+    let mut source = File::open(from)?;
+    let mut dest = File::create(to)?;
+    let file_size = source.metadata()?.len();
+
+    const BUFFER_SIZE: usize = 4 * 1024 * 1024; // 4MB
+    let mut buffer = vec![0; BUFFER_SIZE];
+    let mut bytes_copied: u64 = 0;
+    let mut last_update = Instant::now();
+
+    loop {
+        if let Ok(SyncMessage::Stop) = rx.try_recv() {
+            drop(dest);
+            fs::remove_file(to)?;
+            return Ok(true);
+        }
+
+        let bytes_read = source.read(&mut buffer)?;
+        if bytes_read == 0 {
+            break;
+        }
+        dest.write_all(&buffer[..bytes_read])?;
+        bytes_copied += bytes_read as u64;
+
+        if total_sync_size > 0 && (last_update.elapsed().as_millis() > 100 || bytes_copied == file_size) {
+            let progress = (processed_size_before + bytes_copied) as f32 / total_sync_size as f32;
+            tx.send(SyncMessage::Progress(progress, file_name_for_ui.to_string()))?;
+            last_update = Instant::now();
+        }
+    }
+
+    Ok(false)
 }
 
 fn write_log_entry(entry: &str, usb_path: &Path) -> Result<(), Box<dyn std::error::Error>> {
     let log_path = usb_path.join("SyncU.log");
-    let mut file = fs::OpenOptions::new()
+    let mut file = OpenOptions::new()
         .create(true)
         .append(true)
         .open(log_path)?;
