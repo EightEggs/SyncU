@@ -2,7 +2,7 @@ use crate::models::{FileInfo, SyncData, SyncMessage};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::fs::{self, File};
-use std::io::{self, BufRead, BufReader, Read, Write};
+use std::io::{self, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{Receiver, Sender};
 use std::time::Instant;
@@ -204,43 +204,4 @@ pub fn write_log_entry(message: &str, usb_sync_path: &Path) -> Result<(), io::Er
         .open(log_path)?;
     writeln!(file, "{}", message)?;
     Ok(())
-}
-
-/// Gets a preview of a file's content, handling large files and binary files.
-pub fn get_file_preview(path: &Path) -> String {
-    if let Ok(metadata) = fs::metadata(path) {
-        if metadata.len() > 10_000_000 { // 10MB limit for preview
-            return format!(
-                "文件过大 ({:.2} MB), 无法预览.",
-                metadata.len() as f64 / 10_000_000.0
-            );
-        }
-    }
-
-    if let Ok(file) = File::open(path) {
-        // Try to read as text first
-        let reader = BufReader::new(&file);
-        let mut preview = String::new();
-        for line in reader.lines().take(2000) { // Preview first 2000 lines
-            if let Ok(line) = line {
-                preview.push_str(&line);
-                preview.push('\n');
-            } else {
-                // If we encounter non-UTF8 chars, treat as binary
-                return "[二进制文件, 无内容预览]".to_string();
-            }
-        }
-        if preview.is_empty() {
-            // Check if it's actually an empty file vs. a non-UTF8 file we didn't read
-            if file.metadata().map(|m| m.len()).unwrap_or(1) == 0 {
-                "[空文件]".to_string()
-            } else {
-                 "[二进制文件, 无内容预览]".to_string()
-            }
-        } else {
-            preview
-        }
-    } else {
-        "[无法打开文件]".to_string()
-    }
 }

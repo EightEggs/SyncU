@@ -2,19 +2,16 @@ use crate::models::{Resolution, SyncMessage};
 use crate::sync::run_sync;
 use crate::utils::find_usb_drives;
 use eframe::egui;
-use egui::{Color32, FontFamily, FontId, RichText};
-use similar::{ChangeTag, TextDiff};
+use egui::{Color32, RichText};
 use std::path::PathBuf;
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::thread;
 
 const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
 
-// Represents the state of a file conflict, holding the previews for comparison.
+// Represents the state of a file conflict.
 struct ConflictState {
     path: PathBuf,
-    local_preview: String,
-    remote_preview: String,
 }
 
 // The main application structure.
@@ -30,6 +27,7 @@ pub struct SyncApp {
     show_conflict_resolution: bool,
     file_to_delete: Option<PathBuf>,
     conflict_state: Option<ConflictState>,
+    deletion_choice: Option<bool>, // None: Ask, Some(true): Delete all, Some(false): Keep all
     progress: f32,
     current_file: String,
     tx_to_sync: Sender<SyncMessage>,
@@ -71,41 +69,13 @@ impl SyncApp {
             show_conflict_resolution: false,
             file_to_delete: None,
             conflict_state: None,
+            deletion_choice: None,
             progress: 0.0,
             current_file: "".to_owned(),
             tx_to_sync,
             rx_from_sync,
             ctx,
         }
-    }
-
-    // Helper function to render the text diff view for conflicts.
-    fn render_diff_view(ui: &mut egui::Ui, text1: &str, text2: &str) {
-        let diff = TextDiff::from_lines(text1, text2);
-
-        egui::Grid::new("diff_grid")
-            .num_columns(2)
-            .spacing([40.0, 4.0])
-            .striped(true)
-            .show(ui, |ui| {
-                for (idx, change) in diff.iter_all_changes().enumerate() {
-                    let (marker, color) = match change.tag() {
-                        ChangeTag::Delete => ("-", Color32::from_rgb(139, 0, 0)), // Dark Red
-                        ChangeTag::Insert => ("+", Color32::from_rgb(0, 100, 0)), // Dark Green
-                        ChangeTag::Equal => (" ", ui.style().visuals.text_color()), // Default text color
-                    };
-
-                    let text = RichText::new(format!("{} {}", marker, change))
-                        .color(color)
-                        .font(FontId::new(14.0, FontFamily::Monospace));
-
-                    ui.label(text);
-
-                    if idx % 2 == 1 {
-                        ui.end_row();
-                    }
-                }
-            });
     }
 }
 
@@ -125,12 +95,16 @@ impl eframe::App for SyncApp {
                     self.sync_log.push(RichText::new(log).color(color));
                 }
                 SyncMessage::ConfirmDeletion(path) => {
-                    self.show_confirmation = true;
-                    self.file_to_delete = Some(path);
+                    if let Some(choice) = self.deletion_choice {
+                        self.tx_to_sync.send(SyncMessage::DeletionConfirmed(choice)).ok();
+                    } else {
+                        self.show_confirmation = true;
+                        self.file_to_delete = Some(path);
+                    }
                 }
-                SyncMessage::AskForConflictResolution { path, local_preview, remote_preview } => {
+                SyncMessage::AskForConflictResolution { path } => {
                     self.show_conflict_resolution = true;
-                    self.conflict_state = Some(ConflictState { path, local_preview, remote_preview });
+                    self.conflict_state = Some(ConflictState { path });
                 }
                 SyncMessage::Progress(progress, file) => {
                     self.progress = progress;
@@ -158,15 +132,30 @@ impl eframe::App for SyncApp {
                     ui.label(format!("您确定要删除文件\n'{}'?", file.display()));
                 }
                 ui.add_space(10.0);
-                ui.horizontal(|ui| {
-                    if ui.button("确认").clicked() {
-                        self.tx_to_sync.send(SyncMessage::DeletionConfirmed(true)).ok();
-                        self.show_confirmation = false;
-                    }
-                    if ui.button("取消").clicked() {
-                        self.tx_to_sync.send(SyncMessage::DeletionConfirmed(false)).ok();
-                        self.show_confirmation = false;
-                    }
+                ui.vertical(|ui| {
+                    ui.horizontal(|ui| {
+                        if ui.button("确认").clicked() {
+                            self.tx_to_sync.send(SyncMessage::DeletionConfirmed(true)).ok();
+                            self.show_confirmation = false;
+                        }
+                        if ui.button("取消").clicked() {
+                            self.tx_to_sync.send(SyncMessage::DeletionConfirmed(false)).ok();
+                            self.show_confirmation = false;
+                        }
+                    });
+                    ui.add_space(5.0);
+                    ui.horizontal(|ui| {
+                        if ui.button("全部删除").clicked() {
+                            self.deletion_choice = Some(true);
+                            self.tx_to_sync.send(SyncMessage::DeletionConfirmed(true)).ok();
+                            self.show_confirmation = false;
+                        }
+                        if ui.button("全部保留").clicked() {
+                            self.deletion_choice = Some(false);
+                            self.tx_to_sync.send(SyncMessage::DeletionConfirmed(false)).ok();
+                            self.show_confirmation = false;
+                        }
+                    });
                 });
             });
         }
@@ -174,21 +163,10 @@ impl eframe::App for SyncApp {
         if self.show_conflict_resolution {
             if let Some(conflict) = &self.conflict_state {
                 egui::Window::new(format!("解决冲突: {}", conflict.path.display()))
-                    .default_size([800.0, 600.0]) // Larger default size for diff
-                    .collapsible(true)
-                    .resizable(true)
+                    .collapsible(false)
+                    .resizable(false)
                     .show(ctx, |ui| {
                         ui.label("文件在本地和U盘上均被修改。请选择要保留的版本。");
-                        ui.separator();
-
-                        ui.columns(2, |columns| {
-                            columns[0].heading("本地版本");
-                            columns[1].heading("U盘版本");
-                        });
-
-                        // --- ENHANCED CONFLICT UI ---
-                        Self::render_diff_view(ui, &conflict.local_preview, &conflict.remote_preview);
-
                         ui.separator();
                         ui.horizontal(|ui| {
                             if ui.button("采用本地版本").clicked() {
@@ -197,6 +175,10 @@ impl eframe::App for SyncApp {
                             }
                             if ui.button("采用U盘版本").clicked() {
                                 self.tx_to_sync.send(SyncMessage::ConflictResolved(Resolution::KeepRemote)).ok();
+                                self.show_conflict_resolution = false;
+                            }
+                            if ui.button("跳过").clicked() {
+                                self.tx_to_sync.send(SyncMessage::ConflictResolved(Resolution::Skip)).ok();
                                 self.show_conflict_resolution = false;
                             }
                         });
@@ -245,77 +227,82 @@ impl eframe::App for SyncApp {
         });
 
         egui::CentralPanel::default().show(ctx, |ui| {
-            ui.heading("SyncU: Sync Your Files with USB");
-            ui.add_space(10.0);
+            // When a dialog is shown, disable the main UI
+            let main_ui_enabled = !self.show_conflict_resolution && !self.show_confirmation && !self.show_about_window;
+            ui.add_enabled_ui(main_ui_enabled, |ui| {
+                ui.heading("SyncU: Sync Your Files with USB");
+                ui.add_space(10.0);
 
-            ui.add_enabled_ui(!self.syncing, |ui| {
-                egui::Grid::new("path_grid").num_columns(3).spacing([10.0, 10.0]).show(ui, |ui| {
-                    ui.label("本地文件夹:");
-                    let local_path_text = self.local_folder.as_ref().map_or("未选择", |p| p.to_str().unwrap_or(""));
-                    ui.label(RichText::new(local_path_text).strong());
-                    if ui.button("选择...").clicked() {
-                        if let Some(path) = rfd::FileDialog::new().pick_folder() {
-                            self.local_folder = Some(path);
+                ui.add_enabled_ui(!self.syncing, |ui| {
+                    egui::Grid::new("path_grid").num_columns(3).spacing([10.0, 10.0]).show(ui, |ui| {
+                        ui.label("本地文件夹:");
+                        let local_path_text = self.local_folder.as_ref().map_or("未选择", |p| p.to_str().unwrap_or(""));
+                        ui.label(RichText::new(local_path_text).strong());
+                        if ui.button("选择...").clicked() {
+                            if let Some(path) = rfd::FileDialog::new().pick_folder() {
+                                self.local_folder = Some(path);
+                            }
                         }
-                    }
-                    ui.end_row();
+                        ui.end_row();
 
-                    ui.label("U盘:");
-                    if self.usb_drives.len() > 1 {
-                        egui::ComboBox::from_label("")
-                            .selected_text(self.selected_usb_drive.as_ref().map_or("请选择U盘", |p| p.to_str().unwrap_or("")))
-                            .show_ui(ui, |ui| {
-                                for drive in &self.usb_drives {
-                                    ui.selectable_value(&mut self.selected_usb_drive, Some(drive.clone()), drive.to_str().unwrap_or(""));
-                                }
-                            });
-                    } else {
-                        let usb_path_text = self.selected_usb_drive.as_ref().map_or("未检测到", |p| p.to_str().unwrap_or(""));
-                        ui.label(RichText::new(usb_path_text).strong());
-                    }
-                    if ui.button("刷新").clicked() {
-                        self.usb_drives = find_usb_drives();
-                        if self.usb_drives.len() == 1 {
-                            self.selected_usb_drive = Some(self.usb_drives[0].clone());
+                        ui.label("U盘:");
+                        if self.usb_drives.len() > 1 {
+                            egui::ComboBox::from_label("")
+                                .selected_text(self.selected_usb_drive.as_ref().map_or("请选择U盘", |p| p.to_str().unwrap_or("")))
+                                .show_ui(ui, |ui| {
+                                    for drive in &self.usb_drives {
+                                        ui.selectable_value(&mut self.selected_usb_drive, Some(drive.clone()), drive.to_str().unwrap_or(""));
+                                    }
+                                });
+                        } else {
+                            let usb_path_text = self.selected_usb_drive.as_ref().map_or("未检测到", |p| p.to_str().unwrap_or(""));
+                            ui.label(RichText::new(usb_path_text).strong());
                         }
-                    }
-                    ui.end_row();
+                        if ui.button("刷新").clicked() {
+                            self.usb_drives = find_usb_drives();
+                            if self.usb_drives.len() == 1 {
+                                self.selected_usb_drive = Some(self.usb_drives[0].clone());
+                            }
+                        }
+                        ui.end_row();
+                    });
                 });
-            });
 
-            ui.separator();
-            ui.add_space(10.0);
+                ui.separator();
+                ui.add_space(10.0);
 
-            ui.vertical_centered_justified(|ui| {
-                if self.syncing {
-                    let button_text = if self.stopping { "正在停止..." } else { "停止同步" };
-                    let button_color = if self.stopping { Color32::DARK_GRAY } else { Color32::from_rgb(200, 0, 0) };
-                    let stop_button = egui::Button::new(RichText::new(button_text).color(Color32::WHITE)).fill(button_color).min_size(egui::vec2(120.0, 40.0));
-                    if ui.add_enabled(!self.stopping, stop_button).clicked() {
-                        self.stopping = true;
-                        self.tx_to_sync.send(SyncMessage::Stop).ok();
-                    }
-                } else {
-                    let enabled = self.local_folder.is_some() && self.selected_usb_drive.is_some();
-                    let sync_button = egui::Button::new("立即同步").min_size(egui::vec2(120.0, 40.0));
-                    if ui.add_enabled(enabled, sync_button).clicked() {
-                        self.syncing = true;
-                        self.sync_log = vec![RichText::new("正在开始同步...").color(Color32::WHITE)];
-                        if let (Some(local), Some(usb)) = (self.local_folder.clone(), self.selected_usb_drive.clone()) {
-                            self.tx_to_sync.send(SyncMessage::StartSync(local, usb)).ok();
+                ui.vertical_centered_justified(|ui| {
+                    if self.syncing {
+                        let button_text = if self.stopping { "正在停止..." } else { "停止同步" };
+                        let button_color = if self.stopping { Color32::DARK_GRAY } else { Color32::from_rgb(200, 0, 0) };
+                        let stop_button = egui::Button::new(RichText::new(button_text).color(Color32::WHITE)).fill(button_color).min_size(egui::vec2(120.0, 40.0));
+                        if ui.add_enabled(!self.stopping, stop_button).clicked() {
+                            self.stopping = true;
+                            self.tx_to_sync.send(SyncMessage::Stop).ok();
+                        }
+                    } else {
+                        let enabled = self.local_folder.is_some() && self.selected_usb_drive.is_some();
+                        let sync_button = egui::Button::new("立即同步").min_size(egui::vec2(120.0, 40.0));
+                        if ui.add_enabled(enabled, sync_button).clicked() {
+                            self.syncing = true;
+                            self.deletion_choice = None; // Reset deletion choice at the start of a new sync
+                            self.sync_log = vec![RichText::new("正在开始同步...").color(Color32::WHITE)];
+                            if let (Some(local), Some(usb)) = (self.local_folder.clone(), self.selected_usb_drive.clone()) {
+                                self.tx_to_sync.send(SyncMessage::StartSync(local, usb)).ok();
+                            }
                         }
                     }
-                }
-            });
+                });
 
-            ui.add_space(10.0);
-            ui.separator();
+                ui.add_space(10.0);
+                ui.separator();
 
-            egui::Frame::canvas(ui.style()).show(ui, |ui| {
-                egui::ScrollArea::vertical().stick_to_bottom(true).auto_shrink([false; 2]).show(ui, |ui| {
-                    for log in &self.sync_log {
-                        ui.label(log.clone());
-                    }
+                egui::Frame::canvas(ui.style()).show(ui, |ui| {
+                    egui::ScrollArea::vertical().stick_to_bottom(true).auto_shrink([false; 2]).show(ui, |ui| {
+                        for log in &self.sync_log {
+                            ui.label(log.clone());
+                        }
+                    });
                 });
             });
         });

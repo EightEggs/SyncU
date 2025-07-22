@@ -8,6 +8,7 @@ use std::time::SystemTime;
 pub enum Resolution {
     KeepLocal,
     KeepRemote,
+    Skip,
 }
 
 /// Messages passed between the UI thread and the synchronization thread.
@@ -29,11 +30,7 @@ pub enum SyncMessage {
     /// Asks the user to confirm the deletion of a file.
     ConfirmDeletion(PathBuf),
     /// Asks the user to resolve a conflict between two file versions.
-    AskForConflictResolution {
-        path: PathBuf,
-        local_preview: String,
-        remote_preview: String,
-    },
+    AskForConflictResolution { path: PathBuf },
     /// Reports the progress of the current operation.
     Progress(f32, String),
     /// Indicates that the synchronization process has completed successfully.
@@ -64,9 +61,5 @@ pub enum SyncAction {
     RemoteToLocal(PathBuf),
     DeleteLocal(PathBuf),
     DeleteRemote(PathBuf),
-    Conflict {
-        path: PathBuf,
-        local_preview: String,
-        remote_preview: String,
-    },
+    Conflict { path: PathBuf },
 }
