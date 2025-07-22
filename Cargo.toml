@@ -22,7 +22,7 @@ ico = "0.1.0"
 image = "0.24"
 
 [profile.release]
-opt-level = 'z'  # Optimize for size
+opt-level = 'z'      # Optimize for size
 lto = true           # Enable Link-Time-Optimization
 codegen-units = 1    # Reduce parallelism for better optimization
 panic = 'abort'      # Abort on panic
