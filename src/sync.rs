@@ -309,7 +309,7 @@ pub fn run_sync(
                                 fs::copy(&from, &to)?;
                             }
                             format!(
-                                "[{}] 冲突解决: 保留本地版本 -> {}",
+                                "[{}] 冲突解决: 采用本地版本 -> {}",
                                 Local::now().format("%Y-%m-%d %H:%M:%S"),
                                 path.display()
                             )
@@ -336,7 +336,7 @@ pub fn run_sync(
                                 fs::copy(&from, &to)?;
                             }
                             format!(
-                                "[{}] 冲突解决: 保留U盘版本 -> {}",
+                                "[{}] 冲突解决: 采用U盘版本 -> {}",
                                 Local::now().format("%Y-%m-%d %H:%M:%S"),
                                 path.display()
                             )

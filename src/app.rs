@@ -146,29 +146,29 @@ impl eframe::App for SyncApp {
                     .show(ctx, |ui| {
                         ui.horizontal(|ui| {
                             ui.vertical(|ui| {
-                                ui.heading("本地版本");
+                                ui.heading(egui::RichText::new("本地版本").size(15.0));
                                 egui::ScrollArea::vertical().id_source("local_conflict_preview").show(ui, |ui| {
-                                    ui.add(egui::Label::new(egui::RichText::new(&conflict.local_preview).size(12.0)));
+                                    ui.add(egui::Label::new(egui::RichText::new(&conflict.local_preview).size(14.0)));
                                 });
                             });
                             ui.separator();
                             ui.vertical(|ui| {
-                                ui.heading("U盘版本");
+                                ui.heading(egui::RichText::new("U盘版本").size(15.0));
                                 egui::ScrollArea::vertical().id_source("remote_conflict_preview").show(ui, |ui| {
-                                    ui.add(egui::Label::new(egui::RichText::new(&conflict.remote_preview).size(12.0)));
+                                    ui.add(egui::Label::new(egui::RichText::new(&conflict.remote_preview).size(14.0)));
                                 });
                             });
                         });
 
                         ui.separator();
                         ui.horizontal(|ui| {
-                            if ui.button("保留本地版本").clicked() {
+                            if ui.button("采用本地版本").clicked() {
                                 self.tx_to_sync
                                     .send(SyncMessage::ConflictResolved(Resolution::KeepLocal))
                                     .unwrap_or_default();
                                 self.show_conflict_resolution = false;
                             }
-                            if ui.button("保留U盘版本").clicked() {
+                            if ui.button("采用U盘版本").clicked() {
                                 self.tx_to_sync
                                     .send(SyncMessage::ConflictResolved(Resolution::KeepRemote))
                                     .unwrap_or_default();
