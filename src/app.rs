@@ -81,8 +81,8 @@ impl SyncApp {
 
 impl eframe::App for SyncApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        // Process messages from the sync thread
-        if let Ok(msg) = self.rx_from_sync.try_recv() {
+        // Process all available messages from the sync thread in one go
+        while let Ok(msg) = self.rx_from_sync.try_recv() {
             match msg {
                 SyncMessage::Log(log) => {
                     let color = if log.starts_with("错误") {
