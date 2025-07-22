@@ -174,3 +174,24 @@ pub fn write_log_entry(entry: &str, usb_path: &Path) -> Result<(), Box<dyn std::
     writeln!(file, "{}", entry)?;
     Ok(())
 }
+
+pub fn get_file_preview(path: &Path) -> String {
+    const PREVIEW_SIZE: usize = 1024; // 1KB
+    let mut file = match File::open(path) {
+        Ok(f) => f,
+        Err(_) => return "[File not found]".to_string(),
+    };
+
+    let mut buffer = vec![0; PREVIEW_SIZE];
+    let bytes_read = match file.read(&mut buffer) {
+        Ok(n) => n,
+        Err(_) => return "[Error reading file]".to_string(),
+    };
+
+    buffer.truncate(bytes_read);
+
+    match String::from_utf8(buffer) {
+        Ok(s) => s,
+        Err(_) => "[Binary File - No Preview Available]".to_string(),
+    }
+}

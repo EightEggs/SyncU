@@ -4,10 +4,22 @@ use std::path::PathBuf;
 use std::time::SystemTime;
 
 #[derive(Clone)]
+pub enum Resolution {
+    KeepLocal,
+    KeepRemote,
+}
+
+#[derive(Clone)]
 pub enum SyncMessage {
     Log(String),
     ConfirmDeletion(PathBuf),
     DeletionConfirmed(bool),
+    AskForConflictResolution {
+        path: PathBuf,
+        local_preview: String,
+        remote_preview: String,
+    },
+    ConflictResolved(Resolution),
     Progress(f32, String),
     Complete,
     Stop,
@@ -34,5 +46,9 @@ pub enum SyncAction {
     Download(PathBuf),
     DeleteLocal(PathBuf),
     DeleteRemote(PathBuf),
-    Conflict(PathBuf),
+    Conflict {
+        path: PathBuf,
+        local_preview: String,
+        remote_preview: String,
+    },
 }

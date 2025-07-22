@@ -1,7 +1,7 @@
-use crate::models::{SyncAction, SyncMessage};
+use crate::models::{Resolution, SyncAction, SyncMessage};
 use crate::utils::{
-    copy_large_file_with_progress, load_sync_data, save_sync_data, scan_directory_with_progress,
-    write_log_entry,
+    copy_large_file_with_progress, get_file_preview, load_sync_data, save_sync_data,
+    scan_directory_with_progress, write_log_entry,
 };
 use chrono::Local;
 use std::fs;
@@ -94,7 +94,13 @@ pub fn run_sync(
                     let remote_changed = remote.modified > last.modified;
 
                     if local_changed && remote_changed {
-                        sync_plan.push(SyncAction::Conflict(relative_path.clone()));
+                        let local_preview = get_file_preview(&local_path.join(&relative_path));
+                        let remote_preview = get_file_preview(&usb_sync_path.join(&relative_path));
+                        sync_plan.push(SyncAction::Conflict {
+                            path: relative_path.clone(),
+                            local_preview,
+                            remote_preview,
+                        });
                     } else if local_changed {
                         sync_plan.push(SyncAction::Upload(relative_path.clone()));
                     } else if remote_changed {
@@ -124,7 +130,7 @@ pub fn run_sync(
                     + match action {
                         SyncAction::Upload(path) => fs::metadata(local_path.join(path))?.len(),
                         SyncAction::Download(path) => fs::metadata(usb_sync_path.join(path))?.len(),
-                        SyncAction::Conflict(path) => fs::metadata(local_path.join(path))?.len(),
+                SyncAction::Conflict { path, .. } => fs::metadata(local_path.join(path))?.len(),
                         _ => 0,
                     })
             },
@@ -144,14 +150,14 @@ pub fn run_sync(
             let file_size = match &action {
                 SyncAction::Upload(path) => fs::metadata(local_path.join(path))?.len(),
                 SyncAction::Download(path) => fs::metadata(usb_sync_path.join(path))?.len(),
-                SyncAction::Conflict(path) => fs::metadata(local_path.join(path))?.len(),
+                                        SyncAction::Conflict { path, .. } => fs::metadata(local_path.join(path))?.len(),
                 _ => 0,
             };
 
             let current_file_name = match &action {
                 SyncAction::Upload(path)
-                | SyncAction::Download(path)
-                | SyncAction::Conflict(path) => path.to_str().unwrap_or_default().to_string(),
+                | SyncAction::Download(path) => path.to_str().unwrap_or_default().to_string(),
+                SyncAction::Conflict { path, .. } => path.to_str().unwrap_or_default().to_string(),
                 SyncAction::DeleteLocal(path) | SyncAction::DeleteRemote(path) => {
                     format!("删除: {}", path.to_str().unwrap_or_default())
                 }
@@ -266,43 +272,76 @@ pub fn run_sync(
                         )
                     }
                 }
-                SyncAction::Conflict(path) => {
-                    let local_file_path = local_path.join(&path);
-                    let conflict_path = local_file_path.with_extension(format!(
-                        "{}.conflict",
-                        local_file_path
-                            .extension()
-                            .unwrap_or_default()
-                            .to_str()
-                            .unwrap_or("")
-                    ));
-                    fs::rename(&local_file_path, &conflict_path)?;
-                    let from = usb_sync_path.join(&path);
-                    let to = local_path.join(&path);
-                    if let Some(parent) = to.parent() {
-                        fs::create_dir_all(parent)?;
-                    }
-                    if file_size > LARGE_FILE_THRESHOLD {
-                        if copy_large_file_with_progress(
-                            &from,
-                            &to,
-                            &current_file_name,
-                            &tx,
-                            rx,
-                            total_sync_size,
-                            processed_size,
-                        )? {
-                            return Ok(true); // Stopped
+                SyncAction::Conflict { path, local_preview, remote_preview } => {
+                    tx.send(SyncMessage::AskForConflictResolution {
+                        path: path.clone(),
+                        local_preview,
+                        remote_preview,
+                    })?;
+                    let resolution = loop {
+                        match rx.recv()? {
+                            SyncMessage::ConflictResolved(r) => break r,
+                            SyncMessage::Stop => return Ok(true),
+                            _ => {}
                         }
-                    } else {
-                        fs::copy(&from, &to)?;
+                    };
+
+                    match resolution {
+                        Resolution::KeepLocal => {
+                            let from = local_path.join(&path);
+                            let to = usb_sync_path.join(&path);
+                            if let Some(parent) = to.parent() {
+                                fs::create_dir_all(parent)?;
+                            }
+                            if file_size > LARGE_FILE_THRESHOLD {
+                                if copy_large_file_with_progress(
+                                    &from,
+                                    &to,
+                                    &current_file_name,
+                                    &tx,
+                                    rx,
+                                    total_sync_size,
+                                    processed_size,
+                                )? {
+                                    return Ok(true); // Stopped
+                                }
+                            } else {
+                                fs::copy(&from, &to)?;
+                            }
+                            format!(
+                                "[{}] 冲突解决: 保留本地版本 -> {}",
+                                Local::now().format("%Y-%m-%d %H:%M:%S"),
+                                path.display()
+                            )
+                        }
+                        Resolution::KeepRemote => {
+                            let from = usb_sync_path.join(&path);
+                            let to = local_path.join(&path);
+                            if let Some(parent) = to.parent() {
+                                fs::create_dir_all(parent)?;
+                            }
+                            if file_size > LARGE_FILE_THRESHOLD {
+                                if copy_large_file_with_progress(
+                                    &from,
+                                    &to,
+                                    &current_file_name,
+                                    &tx,
+                                    rx,
+                                    total_sync_size,
+                                    processed_size,
+                                )? {
+                                    return Ok(true); // Stopped
+                                }
+                            } else {
+                                fs::copy(&from, &to)?;
+                            }
+                            format!(
+                                "[{}] 冲突解决: 保留U盘版本 -> {}",
+                                Local::now().format("%Y-%m-%d %H:%M:%S"),
+                                path.display()
+                            )
+                        }
                     }
-                    format!(
-                        "[{}] 冲突: {} 已备份至 {}",
-                        Local::now().format("%Y-%m-%d %H:%M:%S"),
-                        path.display(),
-                        conflict_path.display()
-                    )
                 }
             };
             processed_size += file_size;

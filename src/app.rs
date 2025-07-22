@@ -1,4 +1,4 @@
-use crate::models::SyncMessage;
+use crate::models::{Resolution, SyncMessage};
 use crate::sync::run_sync;
 use crate::utils::find_usb_drives;
 use eframe::egui;
@@ -7,6 +7,12 @@ use std::sync::mpsc::{channel, Receiver, Sender};
 use std::thread;
 
 const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
+
+struct ConflictState {
+    path: PathBuf,
+    local_preview: String,
+    remote_preview: String,
+}
 
 pub struct SyncApp {
     local_folder: Option<PathBuf>,
@@ -17,7 +23,9 @@ pub struct SyncApp {
     stopping: bool,
     show_confirmation: bool,
     show_about_window: bool,
+    show_conflict_resolution: bool,
     file_to_delete: Option<PathBuf>,
+    conflict_state: Option<ConflictState>,
     progress: f32,
     current_file: String,
     tx_to_sync: Sender<SyncMessage>,
@@ -59,7 +67,9 @@ impl SyncApp {
             stopping: false,
             show_confirmation: false,
             show_about_window: false,
+            show_conflict_resolution: false,
             file_to_delete: None,
+            conflict_state: None,
             progress: 0.0,
             current_file: "".to_owned(),
             tx_to_sync,
@@ -77,6 +87,14 @@ impl eframe::App for SyncApp {
                 SyncMessage::ConfirmDeletion(path) => {
                     self.show_confirmation = true;
                     self.file_to_delete = Some(path);
+                }
+                SyncMessage::AskForConflictResolution { path, local_preview, remote_preview } => {
+                    self.show_conflict_resolution = true;
+                    self.conflict_state = Some(ConflictState {
+                        path,
+                        local_preview,
+                        remote_preview,
+                    });
                 }
                 SyncMessage::Progress(progress, file) => {
                     self.progress = progress;
@@ -118,6 +136,47 @@ impl eframe::App for SyncApp {
                         }
                     });
                 });
+        }
+
+        if self.show_conflict_resolution {
+            if let Some(conflict) = &self.conflict_state {
+                egui::Window::new(format!("解决冲突: {}", conflict.path.display()))
+                    .collapsible(false)
+                    .resizable(true)
+                    .show(ctx, |ui| {
+                        ui.horizontal(|ui| {
+                            ui.vertical(|ui| {
+                                ui.heading("本地版本");
+                                egui::ScrollArea::vertical().id_source("local_conflict_preview").show(ui, |ui| {
+                                    ui.add(egui::Label::new(egui::RichText::new(&conflict.local_preview).size(12.0)));
+                                });
+                            });
+                            ui.separator();
+                            ui.vertical(|ui| {
+                                ui.heading("U盘版本");
+                                egui::ScrollArea::vertical().id_source("remote_conflict_preview").show(ui, |ui| {
+                                    ui.add(egui::Label::new(egui::RichText::new(&conflict.remote_preview).size(12.0)));
+                                });
+                            });
+                        });
+
+                        ui.separator();
+                        ui.horizontal(|ui| {
+                            if ui.button("保留本地版本").clicked() {
+                                self.tx_to_sync
+                                    .send(SyncMessage::ConflictResolved(Resolution::KeepLocal))
+                                    .unwrap_or_default();
+                                self.show_conflict_resolution = false;
+                            }
+                            if ui.button("保留U盘版本").clicked() {
+                                self.tx_to_sync
+                                    .send(SyncMessage::ConflictResolved(Resolution::KeepRemote))
+                                    .unwrap_or_default();
+                                self.show_conflict_resolution = false;
+                            }
+                        });
+                    });
+            }
         }
 
         if self.show_about_window {
@@ -183,21 +242,23 @@ impl eframe::App for SyncApp {
 
                         ui.label("U盘:");
                         if self.usb_drives.len() > 1 {
-                            egui::ComboBox::from_label("")
-                                .selected_text(
-                                    self.selected_usb_drive.as_ref().map_or("请选择U盘", |p| {
-                                        p.to_str().unwrap_or_default()
-                                    }),
-                                )
-                                .show_ui(ui, |ui| {
-                                    for drive in &self.usb_drives {
-                                        ui.selectable_value(
-                                            &mut self.selected_usb_drive,
-                                            Some(drive.clone()),
-                                            drive.to_str().unwrap_or_default(),
-                                        );
-                                    }
-                                });
+                            ui.group(|ui| {
+                                egui::ComboBox::from_label("")
+                                    .selected_text(
+                                        self.selected_usb_drive.as_ref().map_or("请选择U盘", |p| {
+                                            p.to_str().unwrap_or_default()
+                                        }),
+                                    )
+                                    .show_ui(ui, |ui| {
+                                        for drive in &self.usb_drives {
+                                            ui.selectable_value(
+                                                &mut self.selected_usb_drive,
+                                                Some(drive.clone()),
+                                                drive.to_str().unwrap_or_default(),
+                                            );
+                                        }
+                                    });
+                            });
                         } else {
                             let usb_path_text = self
                                 .selected_usb_drive
@@ -277,7 +338,7 @@ impl eframe::App for SyncApp {
             ui.separator();
 
             egui::Frame::canvas(ui.style()).show(ui, |ui| {
-                egui::ScrollArea::vertical().show(ui, |ui| {
+                egui::ScrollArea::vertical().id_source("main_log_area").show(ui, |ui| {
                     ui.label(self.sync_log.join("\n"));
                 });
             });
