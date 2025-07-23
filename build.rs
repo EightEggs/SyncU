@@ -35,5 +35,5 @@ fn main() {
     let file = BufWriter::new(File::create("icon.ico").unwrap());
     icon_dir.write(file).unwrap();
 
-    embed_resource::compile("icon.rc");
+    let _ = embed_resource::compile("icon.rc", std::iter::empty::<&str>());
 }

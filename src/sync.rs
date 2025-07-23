@@ -128,7 +128,7 @@ pub fn run_sync(
         let sync_plan_len = sync_plan.len();
 
         if sync_plan.is_empty() {
-            tx.send(SyncMessage::Log("同步完成! 未检测到变化.".to_owned()))?;
+            tx.send(SyncMessage::Log("未检测到变化.".to_owned()))?;
         } else {
             tx.send(SyncMessage::Log(format!("计划执行 {} 个同步操作...", sync_plan_len)))?;
         }

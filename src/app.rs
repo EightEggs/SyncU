@@ -25,6 +25,8 @@ pub struct SyncApp {
     show_confirmation: bool,
     show_about_window: bool,
     show_conflict_resolution: bool,
+    show_error_dialog: bool,
+    error_message: String,
     file_to_delete: Option<PathBuf>,
     conflict_state: Option<ConflictState>,
     deletion_choice: Option<bool>, // None: Ask, Some(true): Delete all, Some(false): Keep all
@@ -61,12 +63,14 @@ impl SyncApp {
             local_folder: None,
             usb_drives,
             selected_usb_drive,
-            sync_log: vec![RichText::new("准备就绪").color(Color32::WHITE)],
+            sync_log: vec![RichText::new("准备就绪").color(Color32::from_rgb(0, 100, 0))],
             syncing: false,
             stopping: false,
             show_confirmation: false,
             show_about_window: false,
             show_conflict_resolution: false,
+            show_error_dialog: false,
+            error_message: "".to_string(),
             file_to_delete: None,
             conflict_state: None,
             deletion_choice: None,
@@ -126,6 +130,18 @@ impl eframe::App for SyncApp {
         }
 
         // --- UI Rendering ---
+        if self.show_error_dialog {
+            egui::Window::new("错误").collapsible(false).resizable(false).show(ctx, |ui| {
+                ui.label(&self.error_message);
+                ui.add_space(10.0);
+                ui.vertical_centered(|ui| {
+                    if ui.button("关闭").clicked() {
+                        self.show_error_dialog = false;
+                    }
+                });
+            });
+        }
+
         if self.show_confirmation {
             egui::Window::new("确认删除").collapsible(false).resizable(false).show(ctx, |ui| {
                 if let Some(file) = &self.file_to_delete {
@@ -201,14 +217,14 @@ impl eframe::App for SyncApp {
         }
 
         egui::TopBottomPanel::top("menu_bar").show(ctx, |ui| {
-            egui::menu::bar(ui, |ui| {
+            ui.horizontal(|ui| {
                 ui.menu_button("文件", |ui| {
                     if ui.button("关于").clicked() {
                         self.show_about_window = true;
-                        ui.close_menu();
+                        ui.close();
                     }
                     if ui.button("退出").clicked() {
-                        _frame.close();
+                        ctx.send_viewport_cmd(egui::ViewportCommand::Close);
                     }
                 });
             });
@@ -228,7 +244,7 @@ impl eframe::App for SyncApp {
 
         egui::CentralPanel::default().show(ctx, |ui| {
             // When a dialog is shown, disable the main UI
-            let main_ui_enabled = !self.show_conflict_resolution && !self.show_confirmation && !self.show_about_window;
+            let main_ui_enabled = !self.show_conflict_resolution && !self.show_confirmation && !self.show_about_window && !self.show_error_dialog;
             ui.add_enabled_ui(main_ui_enabled, |ui| {
                 ui.heading("SyncU: Sync Your Files with USB");
                 ui.add_space(10.0);
@@ -240,7 +256,13 @@ impl eframe::App for SyncApp {
                         ui.label(RichText::new(local_path_text).strong());
                         if ui.button("选择...").clicked() {
                             if let Some(path) = rfd::FileDialog::new().pick_folder() {
-                                self.local_folder = Some(path);
+                                let is_usb = self.usb_drives.iter().any(|usb| path.starts_with(usb));
+                                if is_usb {
+                                    self.error_message = "不能选择U盘或其子文件夹作为本地文件夹。".to_string();
+                                    self.show_error_dialog = true;
+                                } else {
+                                    self.local_folder = Some(path);
+                                }
                             }
                         }
                         ui.end_row();
@@ -286,7 +308,7 @@ impl eframe::App for SyncApp {
                         if ui.add_enabled(enabled, sync_button).clicked() {
                             self.syncing = true;
                             self.deletion_choice = None; // Reset deletion choice at the start of a new sync
-                            self.sync_log = vec![RichText::new("正在开始同步...").color(Color32::WHITE)];
+                            self.sync_log = vec![RichText::new("正在开始同步...").color(Color32::from_rgb(0, 100, 0))];
                             if let (Some(local), Some(usb)) = (self.local_folder.clone(), self.selected_usb_drive.clone()) {
                                 self.tx_to_sync.send(SyncMessage::StartSync(local, usb)).ok();
                             }

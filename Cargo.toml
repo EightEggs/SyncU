@@ -1,25 +1,25 @@
 [package]
 name = "SyncU"
-version = "0.4.2"
+version = "0.4.3"
 edition = "2024"
 
 [dependencies]
-eframe = "0.22.0"
-egui = "0.22.0"
+eframe = "0.32.0"
+egui = "0.32.0"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-walkdir = "2.3"
+walkdir = "2.5"
 sha2 = "0.10"
-sysinfo = "0.29"
-rfd = "0.11"
-image = "0.24"
+sysinfo = "0.36"
+rfd = "0.15"
+image = "0.25"
 chrono = { version = "0.4", features = ["serde"] }
 
 
 [build-dependencies]
-embed-resource = "1.7"
-ico = "0.1.0"
-image = "0.24"
+embed-resource = "3.0"
+ico = "0.4.0"
+image = "0.25"
 
 [profile.release]
 opt-level = 'z'      # Optimize for size

@@ -6,14 +6,15 @@ use std::io::{self, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{Receiver, Sender};
 use std::time::Instant;
-use sysinfo::{DiskExt, System, SystemExt};
+use sysinfo::{System, Disks};
 use walkdir::WalkDir;
 
 /// Finds all removable drives connected to the system.
 pub fn find_usb_drives() -> Vec<PathBuf> {
-    let mut sys = System::new_all();
-    sys.refresh_disks_list();
-    sys.disks()
+    let mut sys = System::new();
+    sys.refresh_all();
+    let disks = Disks::new_with_refreshed_list();
+    disks
         .iter()
         .filter(|d| d.is_removable())
         .map(|d| d.mount_point().to_path_buf())

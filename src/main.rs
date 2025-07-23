@@ -12,19 +12,20 @@ use image::{ImageBuffer, Rgba};
 // Embed the font directly into the binary to ensure portability.
 const FONT_MSYH: &[u8] = include_bytes!("../assets/msyh.ttc");
 
-fn main() {
+fn main() -> Result<(), eframe::Error> {
     let icon = create_icon();
     let options = eframe::NativeOptions {
-        initial_window_size: Some(egui::vec2(800.0, 600.0)), // Increased default size
-        icon_data: Some(eframe::IconData {
-            rgba: icon.into_raw(),
-            width: 64,
-            height: 64,
-        }),
+        viewport: egui::ViewportBuilder::default()
+            .with_inner_size([800.0, 600.0]) // Increased default size
+            .with_icon(egui::IconData {
+                rgba: icon.into_raw(),
+                width: 64,
+                height: 64,
+            }),
         ..Default::default()
     };
 
-    let _ = eframe::run_native(
+    eframe::run_native(
         "SyncU",
         options,
         Box::new(|cc| {
@@ -34,7 +35,7 @@ fn main() {
             // Load the embedded font
             fonts.font_data.insert(
                 "chinese_font".to_owned(),
-                egui::FontData::from_static(FONT_MSYH),
+                egui::FontData::from_static(FONT_MSYH).into(),
             );
 
             // Set the custom font as the first fallback for proportional text
@@ -56,20 +57,42 @@ fn main() {
             // --- Custom Visuals ---
             let mut style = (*cc.egui_ctx.style()).clone();
             style.text_styles = [
-                (egui::TextStyle::Heading, egui::FontId::new(24.0, egui::FontFamily::Proportional)),
-                (egui::TextStyle::Body, egui::FontId::new(16.0, egui::FontFamily::Proportional)),
-                (egui::TextStyle::Button, egui::FontId::new(16.0, egui::FontFamily::Proportional)),
-                (egui::TextStyle::Small, egui::FontId::new(12.0, egui::FontFamily::Proportional)),
-                (egui::TextStyle::Monospace, egui::FontId::new(14.0, egui::FontFamily::Monospace)),
-            ].into();
+                (
+                    egui::TextStyle::Heading,
+                    egui::FontId::new(24.0, egui::FontFamily::Proportional),
+                ),
+                (
+                    egui::TextStyle::Body,
+                    egui::FontId::new(16.0, egui::FontFamily::Proportional),
+                ),
+                (
+                    egui::TextStyle::Button,
+                    egui::FontId::new(16.0, egui::FontFamily::Proportional),
+                ),
+                (
+                    egui::TextStyle::Small,
+                    egui::FontId::new(12.0, egui::FontFamily::Proportional),
+                ),
+                (
+                    egui::TextStyle::Monospace,
+                    egui::FontId::new(14.0, egui::FontFamily::Monospace),
+                ),
+            ]
+            .into();
 
             // A more modern, clean look
             style.visuals = egui::Visuals {
-                window_rounding: 5.0.into(),
                 widgets: egui::style::Widgets::light(),
                 override_text_color: Some(egui::Color32::from_rgb(30, 30, 30)),
                 ..egui::Visuals::light()
             };
+            // Set rounding for all widget states
+            let corner_radius = egui::epaint::CornerRadius::same(5u8);
+            style.visuals.widgets.noninteractive.corner_radius = corner_radius;
+            style.visuals.widgets.inactive.corner_radius = corner_radius;
+            style.visuals.widgets.hovered.corner_radius = corner_radius;
+            style.visuals.widgets.active.corner_radius = corner_radius;
+
             style.visuals.widgets.noninteractive.bg_fill = egui::Color32::from_gray(248);
             style.visuals.widgets.inactive.bg_fill = egui::Color32::from_gray(220);
             style.visuals.widgets.hovered.bg_fill = egui::Color32::from_gray(200);
@@ -78,9 +101,9 @@ fn main() {
 
             cc.egui_ctx.set_style(style);
 
-            Box::new(SyncApp::new(cc.egui_ctx.clone()))
+            Ok(Box::new(SyncApp::new(cc.egui_ctx.clone())))
         }),
-    );
+    )
 }
 
 // Generates the application icon programmatically.
