@@ -22,8 +22,14 @@ ico = "0.4.0"
 image = "0.25"
 
 [profile.release]
-opt-level = 'z'      # Optimize for size
+opt-level = 3
 lto = true           # Enable Link-Time-Optimization
 codegen-units = 1    # Reduce parallelism for better optimization
-panic = 'abort'      # Abort on panic
 strip = true         # Strip symbols from binary
+debug = false
+split-debuginfo = 'off'
+debug-assertions = false
+overflow-checks = false
+panic = 'unwind'
+incremental = false
+rpath = false
