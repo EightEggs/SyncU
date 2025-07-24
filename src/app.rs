@@ -141,15 +141,15 @@ impl eframe::App for SyncApp {
                 .resizable(false)
                 .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
                 .show(ctx, |ui| {
-                    ui.add_space(10.0);
-                    ui.label(&self.error_message);
                     ui.add_space(15.0);
+                    ui.label(&self.error_message);
+                    ui.add_space(10.0);
+                    ui.separator();
                     ui.vertical_centered(|ui| {
                         if ui.button("关闭").clicked() {
                             self.show_error_dialog = false;
                         }
                     });
-                    ui.add_space(10.0);
                 });
         }
 
@@ -159,11 +159,12 @@ impl eframe::App for SyncApp {
                 .resizable(false)
                 .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
                 .show(ctx, |ui| {
-                    ui.add_space(10.0);
+                    ui.add_space(15.0);
                     if let Some(file) = &self.file_to_delete {
                         ui.label(format!("您确定要删除文件\n'{}'？", file.display()));
                     }
-                    ui.add_space(15.0);
+                    ui.add_space(10.0);
+                    ui.separator();
                     ui.vertical(|ui| {
                         ui.horizontal(|ui| {
                             if ui.button("确认").clicked() {
@@ -194,7 +195,6 @@ impl eframe::App for SyncApp {
                             }
                         });
                     });
-                    ui.add_space(10.0);
                 });
         }
 
@@ -205,9 +205,10 @@ impl eframe::App for SyncApp {
                     .resizable(false)
                     .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
                     .show(ctx, |ui| {
-                        ui.add_space(10.0);
-                        ui.label("文件在本地和U盘上均被修改。请选择要保留的版本。");
                         ui.add_space(15.0);
+                        ui.label("文件在本地和U盘上均被修改。请选择要保留的版本。");
+                        ui.add_space(10.0);
+                        ui.separator();
                         ui.horizontal(|ui| {
                             if ui.button("采用本地版本").clicked() {
                                 if let Some(tx) = &self.tx_to_sync {
@@ -231,7 +232,6 @@ impl eframe::App for SyncApp {
                                 self.show_conflict_resolution = false;
                             }
                         });
-                        ui.add_space(10.0);
                     });
             }
         }
@@ -245,20 +245,20 @@ impl eframe::App for SyncApp {
                     ui.add_space(15.0);
                     ui.vertical_centered(|ui| {
                         ui.heading("SyncU");
-                        ui.add_space(5.0);
+                        ui.add_space(10.0);
                         ui.label(format!("版本: {}", APP_VERSION));
-                        ui.add_space(5.0);
+                        ui.add_space(10.0);
                         ui.label("作者: Eight_Eggs");
                         ui.add_space(10.0);
                         ui.hyperlink_to("访问 GitHub 仓库", "https://github.com/EightEggs/SyncU");
                     });
-                    ui.add_space(15.0);
+                    ui.add_space(10.0);
+                    ui.separator();
                     ui.vertical_centered(|ui| {
                         if ui.button("关闭").clicked() {
                             self.show_about_window = false;
                         }
                     });
-                    ui.add_space(10.0);
                 });
         }
 
@@ -327,7 +327,7 @@ impl eframe::App for SyncApp {
                     ui.add_space(5.0);
                 });
 
-                ui.separator();
+                ui.add_space(1.0);
                 ui.add_enabled_ui(self.state == SyncState::Idle, |ui| {
                     ui.vertical_centered(|ui| {
                         egui::Frame::group(ui.style())
@@ -416,7 +416,7 @@ impl eframe::App for SyncApp {
                     });
                 });
 
-                ui.separator();
+                ui.add_space(5.0);
 
                 ui.vertical_centered(|ui| {
                     match self.state {
@@ -488,7 +488,7 @@ impl eframe::App for SyncApp {
                         ui.heading(RichText::new("日志").size(16.0));
                         ui.separator();
                         egui::ScrollArea::vertical()
-                            .max_height(200.0)
+                            .max_height(234.0)
                             .stick_to_bottom(true)
                             .auto_shrink([false; 2])
                             .show(ui, |ui| {
