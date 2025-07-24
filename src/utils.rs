@@ -59,32 +59,6 @@ pub fn scan_directory_with_progress(
     let files = DashMap::new();
     let processed_files = AtomicUsize::new(0);
     let stop_flag = Arc::new(AtomicBool::new(false));
-    let stop_flag_clone = stop_flag.clone();
-
-    // Spawn a thread to listen for stop signals
-    let rx_clone = rx.clone();
-    let stop_flag_for_thread = stop_flag.clone();
-    std::thread::spawn(move || {
-        loop {
-            match rx_clone.try_recv() {
-                Ok(SyncMessage::Stop) => {
-                    stop_flag_for_thread.store(true, Ordering::Relaxed);
-                    break;
-                }
-                Ok(_) => {
-                    // Ignore other message types in this thread
-                }
-                Err(_) => {
-                    // If disconnected or empty, sleep a bit and continue
-                    std::thread::sleep(std::time::Duration::from_millis(100));
-                }
-            }
-            
-            if stop_flag_for_thread.load(Ordering::Relaxed) {
-                break;
-            }
-        }
-    });
 
     // Collect all file entries first
     let entries: Vec<_> = WalkDir::new(base_path)
@@ -97,8 +71,11 @@ pub fn scan_directory_with_progress(
     let results: Vec<_> = entries
         .par_iter()
         .map(|entry| {
-            // Check for stop signal
-            if stop_flag_clone.load(Ordering::Relaxed) {
+            // Check for stop signal from the UI thread
+            if let Ok(SyncMessage::Stop) = rx.try_recv() {
+                stop_flag.store(true, Ordering::Relaxed);
+            }
+            if stop_flag.load(Ordering::Relaxed) {
                 return None;
             }
 
@@ -156,7 +133,7 @@ pub fn scan_directory_with_progress(
                     last_file_info.hash.clone()
                 } else {
                     // File has changed, a new hash is required.
-                    match calculate_hash(path, &stop_flag_clone) {
+                    match calculate_hash(path, &stop_flag) {
                         Ok(Some(h)) => h,
                         Ok(None) => {
                             return None;
@@ -166,7 +143,7 @@ pub fn scan_directory_with_progress(
                 }
             } else {
                 // It's a new file, so we must calculate the hash.
-                match calculate_hash(path, &stop_flag_clone) {
+                match calculate_hash(path, &stop_flag) {
                     Ok(Some(h)) => h,
                     Ok(None) => {
                         return None;
