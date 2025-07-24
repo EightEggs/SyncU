@@ -10,22 +10,26 @@ use std::io::BufWriter;
 fn main() {
     let mut image = ImageBuffer::new(64, 64);
     for (x, y, pixel) in image.enumerate_pixels_mut() {
-        let border = 2;
-        let is_border = x < border || x >= 64 - border || y < border || y >= 64 - border;
-
-        // A simple, modern "S" shape for "SyncU"
-        let is_s_shape = (x > 16 && x < 48 && y > 16 && y < 24) || // Top bar
-            (x > 16 && x < 32 && y > 24 && y < 32) || // Top-left vertical
-            (x > 16 && x < 48 && y > 32 && y < 40) || // Middle bar
-            (x > 32 && x < 48 && y > 40 && y < 48) || // Bottom-right vertical
-            (x > 16 && x < 48 && y > 48 && y < 56); // Bottom bar
-
-        if is_border {
-            *pixel = Rgba([0, 120, 215, 255]); // Blue border
-        } else if is_s_shape {
-            *pixel = Rgba([0, 120, 215, 255]); // Blue 'S'
-        } else {
-            *pixel = Rgba([255, 255, 255, 255]); // White background
+        let background_value = 245;
+        *pixel = Rgba([background_value, background_value, background_value, 255]);
+        
+        let center_x = x as f32 - 32.0;
+        let center_y = y as f32 - 32.0;
+        let distance_from_center = (center_x * center_x + center_y * center_y).sqrt();
+        
+        if distance_from_center < 28.0 {
+            if (x > 18 && x < 46) && 
+               ((y > 18 && y < 24) ||
+                (x > 18 && x < 26 && y > 24 && y < 32) ||
+                (y > 32 && y < 38) ||
+                (x > 38 && x < 46 && y > 38 && y < 46) ||
+                (y > 46 && y < 52)) {
+                *pixel = Rgba([0, 120, 215, 255]);
+            }
+        }
+        
+        if distance_from_center > 26.0 && distance_from_center < 28.0 {
+            *pixel = Rgba([200, 200, 200, 100]);
         }
     }
 
