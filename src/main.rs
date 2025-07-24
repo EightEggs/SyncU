@@ -17,7 +17,7 @@ fn main() -> Result<(), eframe::Error> {
     let icon = create_icon();
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([800.0, 600.0])
+            .with_inner_size([680.0, 600.0])
             .with_icon(egui::IconData {
                 rgba: icon.into_raw(),
                 width: 64,

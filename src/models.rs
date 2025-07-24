@@ -22,8 +22,6 @@ pub enum Theme {
 #[derive(Clone, Debug, PartialEq)]
 pub enum SyncMessage {
     // --- UI to Sync Thread ---
-    /// Tells the sync thread to start a new synchronization task.
-    StartSync(PathBuf, PathBuf),
     /// Confirms or denies a deletion request from the sync thread.
     DeletionConfirmed(bool),
     /// Provides the resolution for a file conflict.
@@ -69,12 +67,4 @@ pub enum SyncAction {
     DeleteLocal(PathBuf),
     DeleteRemote(PathBuf),
     Conflict { path: PathBuf },
-}
-
-/// Represents a change in a file for incremental sync
-#[derive(Debug, Clone)]
-pub enum FileChange {
-    Added(PathBuf),
-    Modified(PathBuf),
-    Removed(PathBuf),
 }

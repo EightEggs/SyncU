@@ -1,5 +1,5 @@
-use crate::models::{Resolution, SyncAction, SyncData, SyncMessage, FileChange};
-use crate::utils::{copy_large_file_with_progress, load_sync_data, save_sync_data, scan_directory_with_progress, write_log_entry, compare_sync_data};
+use crate::models::{Resolution, SyncAction, SyncData, SyncMessage};
+use crate::utils::{copy_large_file_with_progress, load_sync_data, save_sync_data, scan_directory_with_progress, write_log_entry};
 use chrono::Local;
 use crossbeam_channel::Receiver;
 use std::collections::HashSet;
@@ -49,80 +49,64 @@ pub fn run_sync(
                 None => return Ok(true), // Stopped
             };
 
-        // --- INCREMENTAL SYNC: Compare changes instead of full comparison ---
+        // --- UNIFIED SYNC PLAN: Build a single, correct plan of action ---
         tx.send(SyncMessage::Progress(0.0, "正在分析文件差异...".to_string())).map_err(|_| "发送消息失败")?;
-        let local_changes = compare_sync_data(&last_sync_data, &local_sync_data);
+
+        let mut all_paths = HashSet::new();
+        all_paths.extend(last_sync_data.files.keys().cloned());
+        all_paths.extend(local_sync_data.files.keys().cloned());
+        all_paths.extend(remote_sync_data.files.keys().cloned());
+
         let mut sync_plan = Vec::new();
 
-        // Process local changes
-        for change in local_changes {
+        for path in all_paths {
             if rx.try_recv() == Ok(SyncMessage::Stop) {
                 return Ok(true);
             }
-            
-            match change {
-                FileChange::Added(path) | FileChange::Modified(path) => {
-                    sync_plan.push(SyncAction::LocalToRemote(path));
-                }
-                FileChange::Removed(path) => {
-                    sync_plan.push(SyncAction::DeleteRemote(path));
-                }
-            }
-        }
 
-        // Compare remote to local for changes (reverse direction)
-        let remote_changes = compare_sync_data(&SyncData { files: last_sync_data.files.clone().into_iter().filter(|(k, _)| local_sync_data.files.contains_key(k)).collect() }, &remote_sync_data);
-        
-        for change in remote_changes {
-            if rx.try_recv() == Ok(SyncMessage::Stop) {
-                return Ok(true);
-            }
-            
-            match change {
-                FileChange::Added(path) | FileChange::Modified(path) => {
-                    // Check if this file also exists locally and was modified (conflict)
-                    if let Some(local_info) = local_sync_data.files.get(&path) {
-                        if let Some(last_info) = last_sync_data.files.get(&path) {
-                            if local_info.hash != last_info.hash {
-                                // Both local and remote changed - conflict
-                                sync_plan.push(SyncAction::Conflict { path });
-                                continue;
-                            }
-                        }
-                    }
-                    sync_plan.push(SyncAction::RemoteToLocal(path));
-                }
-                FileChange::Removed(path) => {
-                    sync_plan.push(SyncAction::DeleteLocal(path));
-                }
-            }
-        }
+            let last_info = last_sync_data.files.get(&path);
+            let local_info = local_sync_data.files.get(&path);
+            let remote_info = remote_sync_data.files.get(&path);
 
-        // Handle conflicts that exist in both local and remote (both sides modified)
-        let mut processed_paths = HashSet::new();
-        for action in &sync_plan {
-            match action {
-                SyncAction::LocalToRemote(path) | SyncAction::RemoteToLocal(path) | 
-                SyncAction::DeleteLocal(path) | SyncAction::DeleteRemote(path) => {
-                    processed_paths.insert(path.clone());
-                }
-                _ => {}
-            }
-        }
-
-        // Check for conflicts not yet identified
-        for (path, local_info) in &local_sync_data.files {
-            if processed_paths.contains(path) {
-                continue;
-            }
-            
-            if let Some(remote_info) = remote_sync_data.files.get(path) {
-                if let Some(last_info) = last_sync_data.files.get(path) {
-                    // If both local and remote have changed since last sync
-                    if local_info.hash != last_info.hash && remote_info.hash != last_info.hash {
-                        sync_plan.push(SyncAction::Conflict { path: path.clone() });
+            let action = match (local_info, remote_info, last_info) {
+                // Case 1: File exists on all three. Check for changes.
+                (Some(local), Some(remote), Some(last)) => {
+                    let local_changed = local.hash != last.hash;
+                    let remote_changed = remote.hash != last.hash;
+                    if local_changed && remote_changed {
+                        Some(SyncAction::Conflict { path: path.clone() })
+                    } else if local_changed {
+                        Some(SyncAction::LocalToRemote(path.clone()))
+                    } else if remote_changed {
+                        Some(SyncAction::RemoteToLocal(path.clone()))
+                    } else {
+                        None // No changes needed.
                     }
                 }
+                // Case 2: File added locally and remotely since last sync.
+                (Some(local), Some(remote), None) => {
+                    if local.hash == remote.hash {
+                        None // Files are identical, no action needed.
+                    } else {
+                        Some(SyncAction::Conflict { path: path.clone() })
+                    }
+                }
+                // Case 3: File deleted from remote.
+                (Some(_), None, Some(_)) => Some(SyncAction::DeleteLocal(path.clone())),
+                // Case 4: File deleted locally.
+                (None, Some(_), Some(_)) => Some(SyncAction::DeleteRemote(path.clone())),
+                // Case 5: New file added locally.
+                (Some(_), None, None) => Some(SyncAction::LocalToRemote(path.clone())),
+                // Case 6: New file added on remote.
+                (None, Some(_), None) => Some(SyncAction::RemoteToLocal(path.clone())),
+                // Case 7: File deleted from both.
+                (None, None, Some(_)) => None,
+                // Case 8: Path exists only in memory but not on disk, ignore.
+                (None, None, None) => None,
+            };
+
+            if let Some(action) = action {
+                sync_plan.push(action);
             }
         }
 

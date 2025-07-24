@@ -286,30 +286,3 @@ pub fn write_log_entry(message: &str, usb_sync_path: &Path) -> Result<(), io::Er
     writeln!(file, "{}", message)?;
     Ok(())
 }
-
-/// Compares two SyncData structures and returns the differences for incremental sync
-pub fn compare_sync_data(old_data: &SyncData, new_data: &SyncData) -> Vec<crate::models::FileChange> {
-    let mut changes = Vec::new();
-    
-    // Check for modified or new files
-    for (path, new_info) in &new_data.files {
-        if let Some(old_info) = old_data.files.get(path) {
-            // File exists in both, check if modified
-            if old_info.hash != new_info.hash {
-                changes.push(crate::models::FileChange::Modified(path.clone()));
-            }
-        } else {
-            // New file
-            changes.push(crate::models::FileChange::Added(path.clone()));
-        }
-    }
-    
-    // Check for deleted files
-    for path in old_data.files.keys() {
-        if !new_data.files.contains_key(path) {
-            changes.push(crate::models::FileChange::Removed(path.clone()));
-        }
-    }
-    
-    changes
-}
