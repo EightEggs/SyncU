@@ -186,9 +186,7 @@ impl eframe::App for SyncApp {
                                 self.show_confirmation = false;
                             }
                         });
-                        ui.add_space(8.0);
-                        ui.separator();
-                        ui.add_space(8.0);
+                        ui.add_space(5.0);
                         ui.horizontal(|ui| {
                             if ui.button("全部删除").clicked() {
                                 self.deletion_choice = Some(true);
@@ -409,29 +407,27 @@ impl eframe::App for SyncApp {
 
                 ui.vertical_centered(|ui| {
                     if self.syncing {
-                        ui.horizontal(|ui| {
-                            let button_text = if self.stopping {
-                                "正在停止..."
-                            } else {
-                                "停止同步"
-                            };
-                            let stop_button = egui::Button::new(RichText::new(button_text))
-                                .corner_radius(egui::CornerRadius::same(6))
-                                .min_size(egui::vec2(120.0, 36.0));
-                            if ui.add_enabled(!self.stopping, stop_button).clicked() {
-                                self.stopping = true;
-                                self.tx_to_sync.send(SyncMessage::Stop).ok();
-                            }
-                            if !self.stopping {
-                                ui.add(egui::Spinner::new());
-                            }
-                        });
+                        let button_text = if self.stopping {
+                            "正在停止..."
+                        } else {
+                            "停止同步"
+                        };
+                        let stop_button = egui::Button::new(RichText::new(button_text))
+                            .corner_radius(egui::CornerRadius::same(6))
+                            .min_size(egui::vec2(150.0, 40.0));
+                        if ui.add_enabled(!self.stopping, stop_button).clicked() {
+                            self.stopping = true;
+                            self.tx_to_sync.send(SyncMessage::Stop).ok();
+                        }
+                        if !self.stopping {
+                            ui.add(egui::Spinner::new());
+                        };
                     } else {
                         let enabled =
                             self.local_folder.is_some() && self.selected_usb_drive.is_some();
                         let sync_button = egui::Button::new(RichText::new("立即同步"))
                             .corner_radius(egui::CornerRadius::same(6))
-                            .min_size(egui::vec2(120.0, 36.0));
+                            .min_size(egui::vec2(150.0, 40.0));
                         if ui.add_enabled(enabled, sync_button).clicked() {
                             self.syncing = true;
                             self.deletion_choice = None; // Reset deletion choice at the start of a new sync
