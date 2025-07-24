@@ -11,6 +11,13 @@ pub enum Resolution {
     Skip,
 }
 
+/// Defines the available UI themes.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Theme {
+    Light,
+    Dark,
+}
+
 /// Messages passed between the UI thread and the synchronization thread.
 #[derive(Clone, Debug, PartialEq)]
 pub enum SyncMessage {
@@ -62,4 +69,12 @@ pub enum SyncAction {
     DeleteLocal(PathBuf),
     DeleteRemote(PathBuf),
     Conflict { path: PathBuf },
+}
+
+/// Represents a change in a file for incremental sync
+#[derive(Debug, Clone)]
+pub enum FileChange {
+    Added(PathBuf),
+    Modified(PathBuf),
+    Removed(PathBuf),
 }

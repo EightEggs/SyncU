@@ -1,10 +1,13 @@
 use crate::models::{FileInfo, SyncData, SyncMessage};
+use crossbeam_channel::Receiver;
+use dashmap::DashMap;
+use rayon::prelude::*;
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::fs::{self, File};
 use std::io::{self, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
-use std::sync::mpsc::{Receiver, Sender};
+use std::sync::{Arc, atomic::{AtomicBool, AtomicUsize, Ordering}};
 use std::time::Instant;
 use sysinfo::{System, Disks};
 use walkdir::WalkDir;
@@ -24,14 +27,14 @@ pub fn find_usb_drives() -> Vec<PathBuf> {
 /// Calculates the SHA256 hash of a file.
 fn calculate_hash(
     path: &Path,
-    rx: &Receiver<SyncMessage>,
+    stop_flag: &AtomicBool,
 ) -> Result<Option<String>, Box<dyn std::error::Error>> {
     let mut file = File::open(path)?;
     let mut hasher = Sha256::new();
     let mut buffer = vec![0; 8192]; // 8KB buffer
     loop {
         // Check for stop signal periodically to avoid blocking
-        if let Ok(SyncMessage::Stop) = rx.try_recv() {
+        if stop_flag.load(Ordering::Relaxed) {
             return Ok(None);
         }
         let bytes_read = file.read(&mut buffer)?;
@@ -47,49 +50,102 @@ fn calculate_hash(
 /// Skips hashing for files whose size and modification date haven't changed since the last sync.
 pub fn scan_directory_with_progress(
     base_path: &Path,
-    tx: &Sender<SyncMessage>,
+    tx: &crossbeam_channel::Sender<SyncMessage>,
     rx: &Receiver<SyncMessage>,
     total_files: usize,
     ui_message_prefix: &str,
     last_sync_data: &SyncData,
 ) -> Result<Option<SyncData>, Box<dyn std::error::Error>> {
-    let mut files = HashMap::new();
-    let walker = WalkDir::new(base_path).into_iter();
-    let mut processed_files = 0;
+    let files = DashMap::new();
+    let processed_files = AtomicUsize::new(0);
+    let stop_flag = Arc::new(AtomicBool::new(false));
+    let stop_flag_clone = stop_flag.clone();
 
-    for entry in walker.filter_map(|e| e.ok()) {
-        if let Ok(SyncMessage::Stop) = rx.try_recv() {
-            return Ok(None); // Stopped
+    // Spawn a thread to listen for stop signals
+    let rx_clone = rx.clone();
+    let stop_flag_for_thread = stop_flag.clone();
+    std::thread::spawn(move || {
+        loop {
+            match rx_clone.try_recv() {
+                Ok(SyncMessage::Stop) => {
+                    stop_flag_for_thread.store(true, Ordering::Relaxed);
+                    break;
+                }
+                Ok(_) => {
+                    // Ignore other message types in this thread
+                }
+                Err(_) => {
+                    // If disconnected or empty, sleep a bit and continue
+                    std::thread::sleep(std::time::Duration::from_millis(100));
+                }
+            }
+            
+            if stop_flag_for_thread.load(Ordering::Relaxed) {
+                break;
+            }
         }
+    });
 
-        if entry.file_type().is_file() {
-            processed_files += 1;
+    // Collect all file entries first
+    let entries: Vec<_> = WalkDir::new(base_path)
+        .into_iter()
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_type().is_file())
+        .collect();
+
+    // Process files in parallel
+    let results: Vec<_> = entries
+        .par_iter()
+        .map(|entry| {
+            // Check for stop signal
+            if stop_flag_clone.load(Ordering::Relaxed) {
+                return None;
+            }
+
             let path = entry.path();
             let file_name = path.file_name().unwrap_or_default().to_str().unwrap_or_default();
 
             // Ignore metadata and log files
             if file_name == ".syncu_metadata.json" || file_name == ".syncu_log.txt" {
-                continue;
+                return None;
             }
 
-            let relative_path = path.strip_prefix(base_path)?.to_path_buf();
-            let metadata = fs::metadata(path)?;
-            let modified = metadata.modified()?;
+            let relative_path = match path.strip_prefix(base_path) {
+                Ok(p) => p.to_path_buf(),
+                Err(_) => return None,
+            };
+
+            let metadata = match fs::metadata(path) {
+                Ok(m) => m,
+                Err(_) => return None,
+            };
+
+            let modified = match metadata.modified() {
+                Ok(m) => m,
+                Err(_) => return None,
+            };
+
             let size = metadata.len();
 
-            // Send progress update to the UI
-            let progress = if total_files > 0 {
-                processed_files as f32 / total_files as f32
-            } else {
-                1.0
-            };
-            tx.send(SyncMessage::Progress(
-                progress,
-                format!(
-                    "{} ({}/{}) - {}",
-                    ui_message_prefix, processed_files, total_files, file_name
-                ),
-            ))?;
+            // Update progress counter
+            let current_processed = processed_files.fetch_add(1, Ordering::Relaxed) + 1;
+            
+            // Send progress update to the UI (only from one thread to avoid flooding)
+            if current_processed % 10 == 1 { // Update every 10 files to reduce UI load
+                let progress = if total_files > 0 {
+                    current_processed as f32 / total_files as f32
+                } else {
+                    1.0
+                };
+                
+                let _ = tx.send(SyncMessage::Progress(
+                    progress,
+                    format!(
+                        "{} ({}/{}) - {}",
+                        ui_message_prefix, current_processed, total_files, file_name
+                    ),
+                ));
+            }
 
             // --- PERFORMANCE OPTIMIZATION ---
             // Check if the file needs to be re-hashed. If size and modification time are the same,
@@ -100,20 +156,26 @@ pub fn scan_directory_with_progress(
                     last_file_info.hash.clone()
                 } else {
                     // File has changed, a new hash is required.
-                    match calculate_hash(path, rx)? {
-                        Some(h) => h,
-                        None => return Ok(None), // Stop signal received during hashing
+                    match calculate_hash(path, &stop_flag_clone) {
+                        Ok(Some(h)) => h,
+                        Ok(None) => {
+                            return None;
+                        }
+                        Err(_) => return None,
                     }
                 }
             } else {
                 // It's a new file, so we must calculate the hash.
-                match calculate_hash(path, rx)? {
-                    Some(h) => h,
-                    None => return Ok(None), // Stop signal received during hashing
+                match calculate_hash(path, &stop_flag_clone) {
+                    Ok(Some(h)) => h,
+                    Ok(None) => {
+                        return None;
+                    }
+                    Err(_) => return None,
                 }
             };
 
-            files.insert(
+            Some((
                 relative_path.clone(),
                 FileInfo {
                     path: relative_path,
@@ -121,10 +183,25 @@ pub fn scan_directory_with_progress(
                     modified,
                     size,
                 },
-            );
+            ))
+        })
+        .collect();
+
+    // Check if we were stopped
+    if stop_flag.load(Ordering::Relaxed) {
+        return Ok(None);
+    }
+
+    // Collect results into the final HashMap
+    for result in results {
+        if let Some((path, info)) = result {
+            files.insert(path, info);
         }
     }
-    Ok(Some(SyncData { files }))
+
+    // Convert DashMap to HashMap
+    let files_map: HashMap<PathBuf, FileInfo> = files.into_iter().collect();
+    Ok(Some(SyncData { files: files_map }))
 }
 
 /// Saves the synchronization metadata to a JSON file.
@@ -150,7 +227,7 @@ pub fn copy_large_file_with_progress(
     from: &Path,
     to: &Path,
     file_name_for_ui: &str,
-    tx: &Sender<SyncMessage>,
+    tx: &crossbeam_channel::Sender<SyncMessage>,
     rx: &Receiver<SyncMessage>,
     total_sync_size: u64,
     processed_size_before: u64,
@@ -163,11 +240,14 @@ pub fn copy_large_file_with_progress(
     let mut last_update = Instant::now();
 
     loop {
-        if let Ok(SyncMessage::Stop) = rx.try_recv() {
-            // Clean up the partially copied file on cancellation
-            drop(dest);
-            fs::remove_file(to)?;
-            return Ok(true);
+        match rx.try_recv() {
+            Ok(SyncMessage::Stop) => {
+                // Clean up the partially copied file on cancellation
+                drop(dest);
+                let _ = fs::remove_file(to);
+                return Ok(true);
+            }
+            _ => {}
         }
 
         let bytes_read = source.read(&mut buffer)?;
@@ -205,4 +285,31 @@ pub fn write_log_entry(message: &str, usb_sync_path: &Path) -> Result<(), io::Er
         .open(log_path)?;
     writeln!(file, "{}", message)?;
     Ok(())
+}
+
+/// Compares two SyncData structures and returns the differences for incremental sync
+pub fn compare_sync_data(old_data: &SyncData, new_data: &SyncData) -> Vec<crate::models::FileChange> {
+    let mut changes = Vec::new();
+    
+    // Check for modified or new files
+    for (path, new_info) in &new_data.files {
+        if let Some(old_info) = old_data.files.get(path) {
+            // File exists in both, check if modified
+            if old_info.hash != new_info.hash {
+                changes.push(crate::models::FileChange::Modified(path.clone()));
+            }
+        } else {
+            // New file
+            changes.push(crate::models::FileChange::Added(path.clone()));
+        }
+    }
+    
+    // Check for deleted files
+    for path in old_data.files.keys() {
+        if !new_data.files.contains_key(path) {
+            changes.push(crate::models::FileChange::Removed(path.clone()));
+        }
+    }
+    
+    changes
 }

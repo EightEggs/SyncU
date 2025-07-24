@@ -14,6 +14,9 @@ sysinfo = "0.36"
 rfd = "0.15"
 image = "0.25"
 chrono = { version = "0.4", features = ["serde"] }
+rayon = "1.10"           # For parallel processing
+dashmap = "6.1"         # For concurrent hashmaps
+crossbeam-channel = "0.5"  # Thread-safe channel
 
 
 [build-dependencies]
