@@ -241,7 +241,7 @@ pub fn copy_large_file_with_progress(
             tx.send(SyncMessage::Progress(
                 progress,
                 format!(
-                    "复制: {} ({:.0}%)",
+                    "正在处理: {} ({:.0}%)",
                     file_name_for_ui,
                     file_progress * 100.0
                 ),
