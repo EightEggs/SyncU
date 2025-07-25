@@ -1,10 +1,10 @@
 use crate::models::{Resolution, SyncAction, SyncData, SyncMessage};
-use crate::utils::{copy_large_file_with_progress, load_sync_data, save_sync_data, scan_directory_with_progress, write_log_entry};
+use crate::utils::{cleanup_empty_dirs, copy_large_file_with_progress, load_sync_data, prune_ancestor_paths, prune_descendant_paths, save_sync_data, scan_directory_with_progress, write_log_entry};
 use chrono::Local;
 use crossbeam_channel::{Receiver, RecvTimeoutError};
-use std::collections::HashSet;
+use std::collections::{BTreeSet, HashSet};
 use std::fs;
-use std::path::PathBuf;
+use std::path::{PathBuf};
 use std::time::Duration;
 use walkdir::WalkDir;
 
@@ -61,7 +61,7 @@ pub fn run_sync(
 
         if rx.try_recv() == Ok(SyncMessage::Stop) { return Ok(true); }
         tx.send(SyncMessage::Progress(0.0, "正在统计本地文件...".to_string()))?;
-        let local_total = WalkDir::new(local_path).into_iter().filter_map(Result::ok).filter(|e| e.file_type().is_file()).count();
+        let local_total = WalkDir::new(local_path).into_iter().filter_map(Result::ok).count();
         let local_sync_data =
             match scan_directory_with_progress(local_path, &tx, &rx, local_total, "扫描本地", &last_sync_data)? {
                 Some(data) => data,
@@ -70,7 +70,7 @@ pub fn run_sync(
 
         if rx.try_recv() == Ok(SyncMessage::Stop) { return Ok(true); }
         tx.send(SyncMessage::Progress(0.0, "正在统计U盘文件...".to_string()))?;
-        let remote_total = WalkDir::new(&usb_sync_path).into_iter().filter_map(Result::ok).filter(|e| e.file_type().is_file()).count();
+        let remote_total = WalkDir::new(&usb_sync_path).into_iter().filter_map(Result::ok).count();
         let remote_sync_data =
             match scan_directory_with_progress(&usb_sync_path, &tx, &rx, remote_total, "扫描U盘", &last_sync_data)?
             {
@@ -80,14 +80,67 @@ pub fn run_sync(
 
         tx.send(SyncMessage::Progress(0.0, "正在分析文件差异...".to_string()))?;
 
-        let mut all_paths = HashSet::new();
-        all_paths.extend(last_sync_data.files.keys().cloned());
-        all_paths.extend(local_sync_data.files.keys().cloned());
-        all_paths.extend(remote_sync_data.files.keys().cloned());
+        // Use BTreeSet to ensure that operations are ordered correctly (parents before children)
+        let mut sync_plan = BTreeSet::new();
 
-        let mut sync_plan = Vec::new();
+        // --- Directory Synchronization Logic ---
+        let mut all_dirs = HashSet::new();
+        all_dirs.extend(last_sync_data.directories.iter().cloned());
+        all_dirs.extend(local_sync_data.directories.iter().cloned());
+        all_dirs.extend(remote_sync_data.directories.iter().cloned());
 
-        for path in all_paths {
+        // Collect directories for creation/deletion first
+        let mut dirs_to_create_local = HashSet::new();
+        let mut dirs_to_create_remote = HashSet::new();
+        let mut dirs_to_delete_local = HashSet::new();
+        let mut dirs_to_delete_remote = HashSet::new();
+
+        for dir_path in all_dirs {
+            let in_local = local_sync_data.directories.contains(&dir_path);
+            let in_remote = remote_sync_data.directories.contains(&dir_path);
+            let in_last = last_sync_data.directories.contains(&dir_path);
+
+            match (in_local, in_remote, in_last) {
+                // Deleted on remote, so delete on local
+                (true, false, true) => { dirs_to_delete_local.insert(dir_path); },
+                // Deleted on local, so delete on remote
+                (false, true, true) => { dirs_to_delete_remote.insert(dir_path); },
+                // Newly created on local, so create on remote
+                (true, false, false) => { dirs_to_create_remote.insert(dir_path); },
+                // Newly created on remote, so create on local
+                (false, true, false) => { dirs_to_create_local.insert(dir_path); },
+                // All other cases are either already in sync or don't require action
+                _ => {},
+            };
+        }
+
+        // Prune directory lists
+        let final_dirs_to_create_local = prune_ancestor_paths(&dirs_to_create_local);
+        let final_dirs_to_create_remote = prune_ancestor_paths(&dirs_to_create_remote);
+        let final_dirs_to_delete_local = prune_descendant_paths(&dirs_to_delete_local);
+        let final_dirs_to_delete_remote = prune_descendant_paths(&dirs_to_delete_remote);
+
+        // Add pruned directory actions to the sync plan
+        for dir in final_dirs_to_create_local {
+            sync_plan.insert(SyncAction::CreateLocalDir(dir));
+        }
+        for dir in final_dirs_to_create_remote {
+            sync_plan.insert(SyncAction::CreateRemoteDir(dir));
+        }
+        for dir in final_dirs_to_delete_local {
+            sync_plan.insert(SyncAction::DeleteLocalDir(dir));
+        }
+        for dir in final_dirs_to_delete_remote {
+            sync_plan.insert(SyncAction::DeleteRemoteDir(dir));
+        }
+
+        // --- File Synchronization Logic ---
+        let mut all_files = HashSet::new();
+        all_files.extend(last_sync_data.files.keys().cloned());
+        all_files.extend(local_sync_data.files.keys().cloned());
+        all_files.extend(remote_sync_data.files.keys().cloned());
+
+        for path in all_files {
             if rx.try_recv() == Ok(SyncMessage::Stop) {
                 return Ok(true);
             }
@@ -117,9 +170,12 @@ pub fn run_sync(
             };
 
             if let Some(action) = action {
-                sync_plan.push(action);
+                sync_plan.insert(action);
             }
         }
+        
+        // Convert BTreeSet to Vec for processing
+        let sync_plan: Vec<_> = sync_plan.into_iter().collect();
 
         let total_sync_size = sync_plan.iter().try_fold(0u64, |acc, action| -> Result<u64, Box<dyn std::error::Error>> {
             Ok(acc + match action {
@@ -140,7 +196,7 @@ pub fn run_sync(
             tx.send(SyncMessage::Log(format!("计划执行 {} 个同步操作...", sync_plan_len)))?;
         }
 
-        const BATCH_SIZE: usize = 16;
+        const BATCH_SIZE: usize = 5;
         let mut batch_start = 0;
         
         while batch_start < sync_plan.len() {
@@ -165,6 +221,12 @@ pub fn run_sync(
                     }
                     SyncAction::DeleteLocal(path) | SyncAction::DeleteRemote(path) => {
                         (0, format!("删除: {}", path.to_str().unwrap_or("")))
+                    }
+                    SyncAction::CreateLocalDir(path) | SyncAction::CreateRemoteDir(path) => {
+                        (0, format!("创建目录: {}", path.to_str().unwrap_or("")))
+                    }
+                    SyncAction::DeleteLocalDir(path) | SyncAction::DeleteRemoteDir(path) => {
+                        (0, format!("删除目录: {}", path.to_str().unwrap_or("")))
                     }
                 };
 
@@ -205,7 +267,10 @@ pub fn run_sync(
                             _ => return Ok(true), // Stopped or disconnected
                         };
                         if confirmed {
-                            if absolute_path.exists() { fs::remove_file(absolute_path)?; }
+                            if absolute_path.exists() { 
+                                fs::remove_file(&absolute_path)?; 
+                                cleanup_empty_dirs(&absolute_path, &usb_sync_path)?;
+                            }
                             format!("[{}] 删除U盘文件: {}", Local::now().format("%H:%M:%S"), path.display())
                         } else {
                             format!("[{}] 取消删除: {}", Local::now().format("%H:%M:%S"), path.display())
@@ -222,7 +287,10 @@ pub fn run_sync(
                             _ => return Ok(true), // Stopped or disconnected
                         };
                         if confirmed {
-                            if absolute_path.exists() { fs::remove_file(absolute_path)?; }
+                            if absolute_path.exists() { 
+                                fs::remove_file(&absolute_path)?; 
+                                cleanup_empty_dirs(&absolute_path, local_path)?;
+                            }
                             format!("[{}] 删除本地文件: {}", Local::now().format("%H:%M:%S"), path.display())
                         } else {
                             format!("[{}] 取消删除: {}", Local::now().format("%H:%M:%S"), path.display())
@@ -265,6 +333,54 @@ pub fn run_sync(
                                 skipped_files.insert(path.clone());
                                 format!("[{}] 跳过冲突文件: {}", Local::now().format("%H:%M:%S"), path.display())
                             }
+                        }
+                    }
+                    SyncAction::CreateLocalDir(path) => {
+                        fs::create_dir_all(local_path.join(path))?;
+                        format!("[{}] 创建本地目录: {}", Local::now().format("%H:%M:%S"), path.display())
+                    }
+                    SyncAction::CreateRemoteDir(path) => {
+                        fs::create_dir_all(usb_sync_path.join(path))?;
+                        format!("[{}] 创建U盘目录: {}", Local::now().format("%H:%M:%S"), path.display())
+                    }
+                    SyncAction::DeleteLocalDir(path) => {
+                        let dir_to_delete = local_path.join(path);
+                        tx.send(SyncMessage::ConfirmDeletion(dir_to_delete.clone()))?;
+                        let confirmed = match wait_for_message(&rx, |msg| match msg {
+                            SyncMessage::DeletionConfirmed(c) => Some(c),
+                            _ => None,
+                        }) {
+                            Ok(Some(c)) => c,
+                            _ => return Ok(true), // Stopped or disconnected
+                        };
+
+                        if confirmed {
+                            if dir_to_delete.exists() {
+                                fs::remove_dir_all(&dir_to_delete)?;
+                            }
+                            format!("[{}] 删除本地目录: {}", Local::now().format("%H:%M:%S"), path.display())
+                        } else {
+                            format!("[{}] 取消删除目录: {}", Local::now().format("%H:%M:%S"), path.display())
+                        }
+                    }
+                    SyncAction::DeleteRemoteDir(path) => {
+                        let dir_to_delete = usb_sync_path.join(path);
+                        tx.send(SyncMessage::ConfirmDeletion(dir_to_delete.clone()))?;
+                        let confirmed = match wait_for_message(&rx, |msg| match msg {
+                            SyncMessage::DeletionConfirmed(c) => Some(c),
+                            _ => None,
+                        }) {
+                            Ok(Some(c)) => c,
+                            _ => return Ok(true), // Stopped or disconnected
+                        };
+
+                        if confirmed {
+                            if dir_to_delete.exists() {
+                                fs::remove_dir_all(&dir_to_delete)?;
+                            }
+                            format!("[{}] 删除U盘目录: {}", Local::now().format("%H:%M:%S"), path.display())
+                        } else {
+                            format!("[{}] 取消删除目录: {}", Local::now().format("%H:%M:%S"), path.display())
                         }
                     }
                 };
@@ -312,3 +428,4 @@ pub fn run_sync(
         let _ = tx.send(SyncMessage::Complete);
     }
 }
+

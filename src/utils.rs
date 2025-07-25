@@ -1,9 +1,9 @@
 use crate::models::{FileInfo, SyncData, SyncMessage};
 use crossbeam_channel::Receiver;
-use dashmap::DashMap;
+use dashmap::{DashMap, DashSet};
 use rayon::prelude::*;
 use sha2::{Digest, Sha256};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs::{self, File};
 use std::io::{self, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
@@ -52,22 +52,22 @@ pub fn scan_directory_with_progress(
     base_path: &Path,
     tx: &crossbeam_channel::Sender<SyncMessage>,
     rx: &Receiver<SyncMessage>,
-    total_files: usize,
+    total_entries: usize,
     ui_message_prefix: &str,
     last_sync_data: &SyncData,
 ) -> Result<Option<SyncData>, Box<dyn std::error::Error>> {
     let files = DashMap::new();
-    let processed_files = AtomicUsize::new(0);
+    let directories = DashSet::new();
+    let processed_entries = AtomicUsize::new(0);
     let stop_flag = Arc::new(AtomicBool::new(false));
 
-    // Collect all file entries first
+    // Collect all entries first
     let entries: Vec<_> = WalkDir::new(base_path)
         .into_iter()
         .filter_map(|e| e.ok())
-        .filter(|e| e.file_type().is_file())
         .collect();
 
-    // Process files in parallel
+    // Process entries in parallel
     let results: Vec<_> = entries
         .par_iter()
         .map(|entry| {
@@ -91,7 +91,36 @@ pub fn scan_directory_with_progress(
                 Ok(p) => p.to_path_buf(),
                 Err(_) => return None,
             };
+            
+            if relative_path.as_os_str().is_empty() {
+                return None; // Skip the root directory itself
+            }
 
+            // Update progress counter
+            let current_processed = processed_entries.fetch_add(1, Ordering::Relaxed) + 1;
+            
+            if current_processed % 10 == 1 {
+                let progress = if total_entries > 0 {
+                    current_processed as f32 / total_entries as f32
+                } else {
+                    1.0
+                };
+                
+                let _ = tx.send(SyncMessage::Progress(
+                    progress,
+                    format!(
+                        "{} ({}/{}) - {}",
+                        ui_message_prefix, current_processed, total_entries, file_name
+                    ),
+                ));
+            }
+
+            if entry.file_type().is_dir() {
+                directories.insert(relative_path);
+                return None; // Return None for directories as they don't need further processing in this map
+            }
+
+            // From here, we are dealing with a file
             let metadata = match fs::metadata(path) {
                 Ok(m) => m,
                 Err(_) => return None,
@@ -104,50 +133,20 @@ pub fn scan_directory_with_progress(
 
             let size = metadata.len();
 
-            // Update progress counter
-            let current_processed = processed_files.fetch_add(1, Ordering::Relaxed) + 1;
-            
-            // Send progress update to the UI (only from one thread to avoid flooding)
-            if current_processed % 10 == 1 { // Update every 10 files to reduce UI load
-                let progress = if total_files > 0 {
-                    current_processed as f32 / total_files as f32
-                } else {
-                    1.0
-                };
-                
-                let _ = tx.send(SyncMessage::Progress(
-                    progress,
-                    format!(
-                        "{} ({}/{}) - {}",
-                        ui_message_prefix, current_processed, total_files, file_name
-                    ),
-                ));
-            }
-
-            // --- PERFORMANCE OPTIMIZATION ---
-            // Check if the file needs to be re-hashed. If size and modification time are the same,
-            // we can reuse the old hash.
             let hash = if let Some(last_file_info) = last_sync_data.files.get(&relative_path) {
                 if last_file_info.modified == modified && last_file_info.size == size {
-                    // File metadata matches, reuse the existing hash.
                     last_file_info.hash.clone()
                 } else {
-                    // File has changed, a new hash is required.
                     match calculate_hash(path, &stop_flag) {
                         Ok(Some(h)) => h,
-                        Ok(None) => {
-                            return None;
-                        }
+                        Ok(None) => return None,
                         Err(_) => return None,
                     }
                 }
             } else {
-                // It's a new file, so we must calculate the hash.
                 match calculate_hash(path, &stop_flag) {
                     Ok(Some(h)) => h,
-                    Ok(None) => {
-                        return None;
-                    }
+                    Ok(None) => return None,
                     Err(_) => return None,
                 }
             };
@@ -164,21 +163,23 @@ pub fn scan_directory_with_progress(
         })
         .collect();
 
-    // Check if we were stopped
     if stop_flag.load(Ordering::Relaxed) {
         return Ok(None);
     }
 
-    // Collect results into the final HashMap
     for result in results {
         if let Some((path, info)) = result {
             files.insert(path, info);
         }
     }
 
-    // Convert DashMap to HashMap
     let files_map: HashMap<PathBuf, FileInfo> = files.into_iter().collect();
-    Ok(Some(SyncData { files: files_map }))
+    let directories_set: HashSet<PathBuf> = directories.into_iter().collect();
+    
+    Ok(Some(SyncData {
+        files: files_map,
+        directories: directories_set,
+    }))
 }
 
 /// Saves the synchronization metadata to a JSON file.
@@ -261,5 +262,40 @@ pub fn write_log_entry(message: &str, usb_sync_path: &Path) -> Result<(), io::Er
         .append(true)
         .open(log_path)?;
     writeln!(file, "{}", message)?;
+    Ok(())
+}
+
+/// Helper function to remove ancestor paths.
+/// If we have {"a", "a/b"}, it returns {"a/b"}.
+pub fn prune_ancestor_paths(paths: &HashSet<PathBuf>) -> HashSet<PathBuf> {
+    let mut pruned = paths.clone();
+    pruned.retain(|p1| !paths.iter().any(|p2| p1 != p2 && p2.starts_with(p1)));
+    pruned
+}
+
+/// Helper function to remove descendant paths.
+/// If we have {"a", "a/b"}, it returns {"a"}.
+pub fn prune_descendant_paths(paths: &HashSet<PathBuf>) -> HashSet<PathBuf> {
+    let mut pruned = paths.clone();
+    pruned.retain(|p1| !paths.iter().any(|p2| p1 != p2 && p1.starts_with(p2)));
+    pruned
+}
+
+/// Recursively cleans up empty parent directories.
+pub fn cleanup_empty_dirs(start_path: &Path, base_path: &Path) -> Result<(), std::io::Error> {
+    let mut current = start_path.parent();
+    while let Some(dir) = current {
+        if !dir.starts_with(base_path) || dir == base_path {
+            break;
+        }
+        // Check if the directory is empty
+        if dir.read_dir()?.next().is_none() {
+            fs::remove_dir(dir)?;
+        } else {
+            // Stop if we find a non-empty directory
+            break;
+        }
+        current = dir.parent();
+    }
     Ok(())
 }

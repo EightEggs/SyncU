@@ -160,8 +160,9 @@ impl eframe::App for SyncApp {
                 .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
                 .show(ctx, |ui| {
                     ui.add_space(15.0);
-                    if let Some(file) = &self.file_to_delete {
-                        ui.label(format!("您确定要删除文件\n'{}'？", file.display()));
+                    if let Some(path) = &self.file_to_delete {
+                        let item_type = if path.is_dir() { "目录" } else { "文件" };
+                        ui.label(format!("您确定要删除{item_type}\n'{}'？", path.display()));
                     }
                     ui.add_space(10.0);
                     ui.separator();

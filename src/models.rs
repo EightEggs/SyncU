@@ -1,5 +1,5 @@
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::time::SystemTime;
 
@@ -57,14 +57,20 @@ pub struct FileInfo {
 #[derive(Serialize, Deserialize, Debug, Default, Clone)]
 pub struct SyncData {
     pub files: HashMap<PathBuf, FileInfo>,
+    pub directories: HashSet<PathBuf>,
 }
 
 /// Defines a specific synchronization action to be performed.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum SyncAction {
     LocalToRemote(PathBuf),
     RemoteToLocal(PathBuf),
     DeleteLocal(PathBuf),
     DeleteRemote(PathBuf),
     Conflict { path: PathBuf },
+    // Directory actions
+    CreateLocalDir(PathBuf),
+    CreateRemoteDir(PathBuf),
+    DeleteLocalDir(PathBuf),
+    DeleteRemoteDir(PathBuf),
 }
