@@ -196,7 +196,7 @@ pub fn run_sync(
             tx.send(SyncMessage::Log(format!("计划执行 {} 个同步操作...", sync_plan_len)))?;
         }
 
-        const BATCH_SIZE: usize = 5;
+        const BATCH_SIZE: usize = 16;
         let mut batch_start = 0;
         
         while batch_start < sync_plan.len() {
