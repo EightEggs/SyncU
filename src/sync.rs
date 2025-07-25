@@ -140,124 +140,140 @@ pub fn run_sync(
             tx.send(SyncMessage::Log(format!("计划执行 {} 个同步操作...", sync_plan_len)))?;
         }
 
-        for (index, action) in sync_plan.iter().enumerate() {
+        const BATCH_SIZE: usize = 16;
+        let mut batch_start = 0;
+        
+        while batch_start < sync_plan.len() {
             if rx.try_recv() == Ok(SyncMessage::Stop) {
                 return Ok(true);
             }
+            
+            let batch_end = std::cmp::min(batch_start + BATCH_SIZE, sync_plan.len());
+            let batch = &sync_plan[batch_start..batch_end];
 
-            let (file_size, current_file_name) = match action {
-                SyncAction::LocalToRemote(path) | SyncAction::RemoteToLocal(path) | SyncAction::Conflict { path, .. } => {
-                    let full_path = if matches!(action, SyncAction::RemoteToLocal(_)) { usb_sync_path.join(path) } else { local_path.join(path) };
-                    (fs::metadata(&full_path).map(|m| m.len()).unwrap_or(0), path.to_str().unwrap_or("").to_string())
-                }
-                SyncAction::DeleteLocal(path) | SyncAction::DeleteRemote(path) => {
-                    (0, format!("删除: {}", path.to_str().unwrap_or("")))
-                }
-            };
+            for (i, action) in batch.iter().enumerate() {
+                let index = batch_start + i;
 
-            let progress = if total_sync_size > 0 { processed_size as f32 / total_sync_size as f32 } else { 0.0 };
-            tx.send(SyncMessage::Progress(progress, format!("({}/{})正在处理: {}", index + 1, sync_plan_len, current_file_name)))?;
+                if rx.try_recv() == Ok(SyncMessage::Stop) {
+                    return Ok(true);
+                }
 
-            let message = match action {
-                SyncAction::LocalToRemote(path) => {
-                    let from = local_path.join(path);
-                    let to = usb_sync_path.join(path);
-                    if let Some(parent) = to.parent() { fs::create_dir_all(parent)?; }
-                    if fs::metadata(&from)?.len() > LARGE_FILE_THRESHOLD {
-                        if copy_large_file_with_progress(&from, &to, &current_file_name, &tx, &rx, total_sync_size, processed_size)? {
-                            return Ok(true); // Stopped
-                        }
-                    } else { fs::copy(&from, &to)?; }
-                    format!("[{}] 本地 -> U盘: {}", Local::now().format("%H:%M:%S"), from.strip_prefix(local_path)?.display())
-                }
-                SyncAction::RemoteToLocal(path) => {
-                    let from = usb_sync_path.join(path);
-                    let to = local_path.join(path);
-                    if let Some(parent) = to.parent() { fs::create_dir_all(parent)?; }
-                    if fs::metadata(&from)?.len() > LARGE_FILE_THRESHOLD {
-                        if copy_large_file_with_progress(&from, &to, &current_file_name, &tx, &rx, total_sync_size, processed_size)? {
-                            return Ok(true); // Stopped
-                        }
-                    } else { fs::copy(&from, &to)?; }
-                    format!("[{}] U盘 -> 本地: {}", Local::now().format("%H:%M:%S"), from.strip_prefix(&usb_sync_path)?.display())
-                }
-                SyncAction::DeleteRemote(path) => {
-                    let absolute_path = usb_sync_path.join(path);
-                    tx.send(SyncMessage::ConfirmDeletion(absolute_path.clone()))?;
-                    let confirmed = match wait_for_message(&rx, |msg| match msg {
-                        SyncMessage::DeletionConfirmed(c) => Some(c),
-                        _ => None,
-                    }) {
-                        Ok(Some(c)) => c,
-                        _ => return Ok(true), // Stopped or disconnected
-                    };
-                    if confirmed {
-                        if absolute_path.exists() { fs::remove_file(absolute_path)?; }
-                        format!("[{}] 删除U盘文件: {}", Local::now().format("%H:%M:%S"), path.display())
-                    } else {
-                        format!("[{}] 取消删除: {}", Local::now().format("%H:%M:%S"), path.display())
+                let (file_size, current_file_name) = match action {
+                    SyncAction::LocalToRemote(path) | SyncAction::RemoteToLocal(path) | SyncAction::Conflict { path, .. } => {
+                        let full_path = if matches!(action, SyncAction::RemoteToLocal(_)) { usb_sync_path.join(path) } else { local_path.join(path) };
+                        (fs::metadata(&full_path).map(|m| m.len()).unwrap_or(0), path.to_str().unwrap_or("").to_string())
                     }
-                }
-                SyncAction::DeleteLocal(path) => {
-                    let absolute_path = local_path.join(path);
-                    tx.send(SyncMessage::ConfirmDeletion(absolute_path.clone()))?;
-                    let confirmed = match wait_for_message(&rx, |msg| match msg {
-                        SyncMessage::DeletionConfirmed(c) => Some(c),
-                        _ => None,
-                    }) {
-                        Ok(Some(c)) => c,
-                        _ => return Ok(true), // Stopped or disconnected
-                    };
-                    if confirmed {
-                        if absolute_path.exists() { fs::remove_file(absolute_path)?; }
-                        format!("[{}] 删除本地文件: {}", Local::now().format("%H:%M:%S"), path.display())
-                    } else {
-                        format!("[{}] 取消删除: {}", Local::now().format("%H:%M:%S"), path.display())
+                    SyncAction::DeleteLocal(path) | SyncAction::DeleteRemote(path) => {
+                        (0, format!("删除: {}", path.to_str().unwrap_or("")))
                     }
-                }
-                SyncAction::Conflict { path } => {
-                    tx.send(SyncMessage::AskForConflictResolution { path: path.clone() })?;
-                    let resolution = match wait_for_message(&rx, |msg| match msg {
-                        SyncMessage::ConflictResolved(r) => Some(r),
-                        _ => None,
-                    }) {
-                        Ok(Some(r)) => r,
-                        _ => return Ok(true), // Stopped or disconnected
-                    };
+                };
 
-                    match resolution {
-                        Resolution::KeepLocal => {
-                            let from = local_path.join(path);
-                            let to = usb_sync_path.join(path);
-                            if let Some(parent) = to.parent() { fs::create_dir_all(parent)?; }
-                            if fs::metadata(&from)?.len() > LARGE_FILE_THRESHOLD {
-                                if copy_large_file_with_progress(&from, &to, &current_file_name, &tx, &rx, total_sync_size, processed_size)? {
-                                    return Ok(true); // Stopped
-                                }
-                            } else { fs::copy(&from, &to)?; }
-                            format!("[{}] 冲突解决 (采用本地): {}", Local::now().format("%H:%M:%S"), from.strip_prefix(local_path)?.display())
-                        }
-                        Resolution::KeepRemote => {
-                            let from = usb_sync_path.join(path);
-                            let to = local_path.join(path);
-                            if let Some(parent) = to.parent() { fs::create_dir_all(parent)?; }
-                            if fs::metadata(&from)?.len() > LARGE_FILE_THRESHOLD {
-                                if copy_large_file_with_progress(&from, &to, &current_file_name, &tx, &rx, total_sync_size, processed_size)? {
-                                    return Ok(true); // Stopped
-                                }
-                            } else { fs::copy(&from, &to)?; }
-                            format!("[{}] 冲突解决 (采用U盘): {}", Local::now().format("%H:%M:%S"), from.strip_prefix(&usb_sync_path)?.display())
-                        }
-                        Resolution::Skip => {
-                            skipped_files.insert(path.clone());
-                            format!("[{}] 跳过冲突文件: {}", Local::now().format("%H:%M:%S"), path.display())
+                let progress = if total_sync_size > 0 { processed_size as f32 / total_sync_size as f32 } else { 0.0 };
+                tx.send(SyncMessage::Progress(progress, format!("({}/{})正在处理: {}", index + 1, sync_plan_len, current_file_name)))?;
+
+                let message = match action {
+                    SyncAction::LocalToRemote(path) => {
+                        let from = local_path.join(path);
+                        let to = usb_sync_path.join(path);
+                        if let Some(parent) = to.parent() { fs::create_dir_all(parent)?; }
+                        if fs::metadata(&from)?.len() > LARGE_FILE_THRESHOLD {
+                            if copy_large_file_with_progress(&from, &to, &current_file_name, &tx, &rx, total_sync_size, processed_size)? {
+                                return Ok(true); // Stopped
+                            }
+                        } else { fs::copy(&from, &to)?; }
+                        format!("[{}] 本地 -> U盘: {}", Local::now().format("%H:%M:%S"), from.strip_prefix(local_path)?.display())
+                    }
+                    SyncAction::RemoteToLocal(path) => {
+                        let from = usb_sync_path.join(path);
+                        let to = local_path.join(path);
+                        if let Some(parent) = to.parent() { fs::create_dir_all(parent)?; }
+                        if fs::metadata(&from)?.len() > LARGE_FILE_THRESHOLD {
+                            if copy_large_file_with_progress(&from, &to, &current_file_name, &tx, &rx, total_sync_size, processed_size)? {
+                                return Ok(true); // Stopped
+                            }
+                        } else { fs::copy(&from, &to)?; }
+                        format!("[{}] U盘 -> 本地: {}", Local::now().format("%H:%M:%S"), from.strip_prefix(&usb_sync_path)?.display())
+                    }
+                    SyncAction::DeleteRemote(path) => {
+                        let absolute_path = usb_sync_path.join(path);
+                        tx.send(SyncMessage::ConfirmDeletion(absolute_path.clone()))?;
+                        let confirmed = match wait_for_message(&rx, |msg| match msg {
+                            SyncMessage::DeletionConfirmed(c) => Some(c),
+                            _ => None,
+                        }) {
+                            Ok(Some(c)) => c,
+                            _ => return Ok(true), // Stopped or disconnected
+                        };
+                        if confirmed {
+                            if absolute_path.exists() { fs::remove_file(absolute_path)?; }
+                            format!("[{}] 删除U盘文件: {}", Local::now().format("%H:%M:%S"), path.display())
+                        } else {
+                            format!("[{}] 取消删除: {}", Local::now().format("%H:%M:%S"), path.display())
                         }
                     }
-                }
-            };
-            processed_size += file_size;
-            tx.send(SyncMessage::Log(message.clone()))?;
-            write_log_entry(&message, &usb_sync_path)?;
+                    SyncAction::DeleteLocal(path) => {
+                        let absolute_path = local_path.join(path);
+                        tx.send(SyncMessage::ConfirmDeletion(absolute_path.clone()))?;
+                        let confirmed = match wait_for_message(&rx, |msg| match msg {
+                            SyncMessage::DeletionConfirmed(c) => Some(c),
+                            _ => None,
+                        }) {
+                            Ok(Some(c)) => c,
+                            _ => return Ok(true), // Stopped or disconnected
+                        };
+                        if confirmed {
+                            if absolute_path.exists() { fs::remove_file(absolute_path)?; }
+                            format!("[{}] 删除本地文件: {}", Local::now().format("%H:%M:%S"), path.display())
+                        } else {
+                            format!("[{}] 取消删除: {}", Local::now().format("%H:%M:%S"), path.display())
+                        }
+                    }
+                    SyncAction::Conflict { path } => {
+                        tx.send(SyncMessage::AskForConflictResolution { path: path.clone() })?;
+                        let resolution = match wait_for_message(&rx, |msg| match msg {
+                            SyncMessage::ConflictResolved(r) => Some(r),
+                            _ => None,
+                        }) {
+                            Ok(Some(r)) => r,
+                            _ => return Ok(true), // Stopped or disconnected
+                        };
+
+                        match resolution {
+                            Resolution::KeepLocal => {
+                                let from = local_path.join(path);
+                                let to = usb_sync_path.join(path);
+                                if let Some(parent) = to.parent() { fs::create_dir_all(parent)?; }
+                                if fs::metadata(&from)?.len() > LARGE_FILE_THRESHOLD {
+                                    if copy_large_file_with_progress(&from, &to, &current_file_name, &tx, &rx, total_sync_size, processed_size)? {
+                                        return Ok(true); // Stopped
+                                    }
+                                } else { fs::copy(&from, &to)?; }
+                                format!("[{}] 冲突解决 (采用本地): {}", Local::now().format("%H:%M:%S"), from.strip_prefix(local_path)?.display())
+                            }
+                            Resolution::KeepRemote => {
+                                let from = usb_sync_path.join(path);
+                                let to = local_path.join(path);
+                                if let Some(parent) = to.parent() { fs::create_dir_all(parent)?; }
+                                if fs::metadata(&from)?.len() > LARGE_FILE_THRESHOLD {
+                                    if copy_large_file_with_progress(&from, &to, &current_file_name, &tx, &rx, total_sync_size, processed_size)? {
+                                        return Ok(true); // Stopped
+                                    }
+                                } else { fs::copy(&from, &to)?; }
+                                format!("[{}] 冲突解决 (采用U盘): {}", Local::now().format("%H:%M:%S"), from.strip_prefix(&usb_sync_path)?.display())
+                            }
+                            Resolution::Skip => {
+                                skipped_files.insert(path.clone());
+                                format!("[{}] 跳过冲突文件: {}", Local::now().format("%H:%M:%S"), path.display())
+                            }
+                        }
+                    }
+                };
+                processed_size += file_size;
+                tx.send(SyncMessage::Log(message.clone()))?;
+                write_log_entry(&message, &usb_sync_path)?;
+            }
+            
+            batch_start = batch_end;
         }
 
         if rx.try_recv() == Ok(SyncMessage::Stop) { return Ok(true); }
